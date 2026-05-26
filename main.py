@@ -210,12 +210,38 @@ def main():
     _horizons = getattr(config, "FORECAST_HORIZONS_PERIODS", [3, 6, 12])
     H = _horizons[1]  # 30 мин при шаге 5 мин
     history_ms = pd.concat([train, val, test]).sort_values("ds").reset_index(drop=True)
+
+    # Восстанавливаем экзогенные колонки, если cleaner их не сохранил
+    _exog_cols = getattr(config, "EXOG_COLS", [])
+    for _col in _exog_cols:
+        if _col not in history_ms.columns:
+            if _col in df.columns:
+                _col_map = df.drop_duplicates("ds").set_index("ds")[_col]
+                history_ms[_col] = history_ms["ds"].map(_col_map).fillna(0).astype(int)
+            else:
+                history_ms[_col] = 0
+
+    # Экзогенные для горизонта прогноза: генерируем H строк с нулями
+    # (calendar flags = 0 означает «обычный день без событий»)
+    _last_ts = pd.to_datetime(history_ms["ds"].iloc[-1])
+    _step_sec = history_ms["ds"].diff().dropna().dt.total_seconds().median()
+    _step_min = float(_step_sec / 60) if not np.isnan(_step_sec) else 1.0
+    _future_ts = pd.date_range(
+        start=_last_ts + pd.Timedelta(minutes=_step_min),
+        periods=H, freq=f"{int(_step_min)}min",
+    )
+    _exog_cols = getattr(config, "EXOG_COLS", [])
+    exog_future = pd.DataFrame({"ds": _future_ts})
+    for _col in _exog_cols:
+        exog_future[_col] = 0
+
     ms_forecast = recursive_forecast(
         history_df=history_ms,
         model=model,
         predict_fn=predict_xgboost,
         builder=builder,
         horizon=H,
+        exog_future=exog_future,
     )
     print(f"  Горизонт: H={H} шагов вперёд от конца тест-периода")
     for _, r in ms_forecast.iterrows():

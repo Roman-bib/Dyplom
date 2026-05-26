@@ -252,18 +252,24 @@ class TimeSeriesCleaner:
         # Добавляем обратно экзогенные колонки из исходного df (по метке времени)
         try:
             import config as _cfg
-            for ecol in getattr(_cfg, "EXOG_COLS", []):
-                if ecol in df.columns:
-                    ecol_series = (
-                        df.set_index(ts_col)[ecol]
-                        .reindex(work.index)
-                        .ffill()
-                        .bfill()
-                        .fillna(0)
-                    )
-                    out[ecol] = ecol_series.values
-        except (ImportError, Exception):
-            pass
+            exog_cols_cfg = getattr(_cfg, "EXOG_COLS", [])
+        except ImportError:
+            exog_cols_cfg = []
+        for ecol in exog_cols_cfg:
+            if ecol not in df.columns:
+                continue
+            try:
+                df_indexed = df.drop_duplicates(subset=[ts_col]).set_index(ts_col)
+                ecol_series = (
+                    df_indexed[ecol]
+                    .reindex(work.index)
+                    .ffill()
+                    .bfill()
+                    .fillna(0)
+                )
+                out[ecol] = ecol_series.values
+            except Exception:
+                out[ecol] = 0
 
         stats = {
             "n_output":           len(out),
