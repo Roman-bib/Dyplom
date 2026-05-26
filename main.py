@@ -1,379 +1,623 @@
 """
-Система прогнозирования пиковых нагрузок (ВКР).
+Точка входа системы прогнозирования пиковых нагрузок.
 
-Запуск:
-  python main.py --path ../data/azure_public.csv
-  python main.py --path ../data/azure_public.csv --fast   # без NeuralProphet
+Режимы запуска:
+  python main.py csv       -- РЕКОМЕНДУЕТСЯ: обучение на готовом CSV (web_traffic.csv)
+  python main.py train     -- обучение моделей (Prometheus или синтетика)
+  python main.py compare   -- сравнение всех моделей с таблицей результатов
+  python main.py simulate  -- симуляция проактивного масштабирования
+  python main.py demo      -- полный пайплайн на синтетических данных (без Prometheus)
+
+Примеры:
+  python main.py csv                     # web_traffic.csv, сравнение моделей
+  python main.py csv --fast              # без NeuralProphet и LSTM
+  python main.py csv --months 3          # только первые 3 месяца
+  python main.py demo
+  python main.py train --synthetic
 """
 
 import argparse
 import os
 import sys
+import time
 import warnings
 
-import numpy as np
 import joblib
+import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
 
 import config
 from preprocessing.feature_engineering import FeatureBuilder, split_train_val_test
-from preprocessing.data_cleaning import TimeSeriesCleaner
-from models.forecasters import (
-    train_xgboost, train_xgboost_random_search, predict_xgboost, predict_xgboost_wf,
+from models.xgboost_model import (
+    train_xgboost, predict_xgboost,
     get_confidence_interval, feature_importance,
 )
-from models.multistep import recursive_forecast
-from models.comparison import ModelComparison
-from evaluation.metrics import (
-    plot_forecast, plot_all_forecasts,
-    export_metrics_csv, export_predictions_csv, export_feature_importance_csv,
-)
-from evaluation.peak_detection import PeakDetector, ResidualAnomalyDetector, plot_peaks
-from evaluation.walk_forward import run_walk_forward
-from retraining.scheduler import make_multi_model_train_fn
-from retraining.drift_detector import ADWINDriftDetector
+from models.model_comparison import ModelComparison
+from scaling.scaler import MomentumScaler
+from evaluation.metrics import evaluate, plot_forecast, plot_all_forecasts
+from evaluation.peak_detection import PeakDetector
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Система прогнозирования пиковых нагрузок (ВКР)",
-    )
-    parser.add_argument("--path", default=None,
-                        help="Путь к CSV-файлу датасета")
-    parser.add_argument("--fast", action="store_true",
-                        help="Пропустить NeuralProphet (ускоряет запуск)")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Загрузка данных
+# ---------------------------------------------------------------------------
 
-    os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # 1. Загрузка данных
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("ШАГ 1: ЗАГРУЗКА ДАННЫХ")
-    print("=" * 60)
-
-    if args.path:
-        from data_collection.csv_loader import load_csv
-        df = load_csv(args.path)
+def load_data(use_synthetic: bool = False, days: int = None) -> pd.DataFrame:
+    """Загружает данные из Prometheus или генерирует синтетические."""
+    if use_synthetic:
+        from data_collection.synthetic_data import generate_synthetic_traffic
+        days = days or config.SYNTHETIC_DAYS
+        print(f"Генерация синтетических данных: {days} дней...")
+        df = generate_synthetic_traffic(
+            days=days,
+            freq=config.DEFAULT_STEP,
+            base_rps=config.SYNTHETIC_BASE_RPS,
+            noise_std=config.SYNTHETIC_NOISE_STD,
+            peak_probability=config.SYNTHETIC_PEAK_PROB,
+            peak_multiplier=config.SYNTHETIC_PEAK_MULTIPLIER,
+        )
     else:
-        from data_collection.csv_loader import load_web_traffic
-        df = load_web_traffic()
+        from data_collection.prometheus_connector import fetch_metric
+        print("Загрузка данных из Prometheus...")
+        df = fetch_metric(
+            config.PROMETHEUS_QUERY,
+            days_ago=days or config.DEFAULT_DAYS_AGO,
+            step=config.DEFAULT_STEP,
+        )
 
-    n = len(df)
-    print(f"Загружено {n} точек | "
-          f"RPS: min={df['y'].min():.0f}  max={df['y'].max():.0f}  "
+    print(f"Загружено {len(df)} точек | "
+          f"RPS: min={df['y'].min():.0f}, max={df['y'].max():.0f}, "
           f"mean={df['y'].mean():.0f}")
-    print(f"Период: {df['ds'].iloc[0]}  ->  {df['ds'].iloc[-1]}\n")
+    return df
 
-    if n < 200:
-        print("Недостаточно данных. Проверьте файл.")
-        sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # 2. Предобработка и разбиение
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("ШАГ 2: ПРЕДОБРАБОТКА")
-    print("=" * 60)
+# ---------------------------------------------------------------------------
+# Режим: обучение одной модели (XGBoost) + оценка
+# ---------------------------------------------------------------------------
 
-    # Для 1-минутных данных 480 точек = 8 часов — слишком мало.
-    # Берём ~10% датасета, но не менее 2 дней (2880 точек) и не более 14 дней (20160).
-    TEST_H = max(2880, min(20160, n * 15 // 100))
-    train_raw, val_raw, test_raw = split_train_val_test(df, test_hours=TEST_H, val_hours=TEST_H)
+def mode_train(args):
+    df = load_data(use_synthetic=args.synthetic)
+    train, val, test = split_train_val_test(
+        df,
+        test_hours=config.SPLIT_TEST_HOURS,
+        val_hours=config.SPLIT_VAL_HOURS,
+    )
+    print(f"Train={len(train)}, Val={len(val)}, Test={len(test)} точек\n")
 
-    cleaner = TimeSeriesCleaner()
-    train, train_stats = cleaner.fit(train_raw).transform(train_raw)
-    val,   _           = cleaner.transform(val_raw)
-    test,  test_stats  = cleaner.transform(test_raw)
-    cleaner.save(config.MODEL_SAVE_DIR)
-    print(f"Train={len(train)}, Val={len(val)}, Test={len(test)} точек")
-    print(f"  Очистка train: шум удалён={train_stats['n_outliers_removed']}, "
-          f"легитимных пиков сохранено={train_stats['n_peaks_preserved']}")
-    print(f"  Очистка test:  шум удалён={test_stats['n_outliers_removed']}, "
-          f"легитимных пиков сохранено={test_stats['n_peaks_preserved']}\n")
-
-    # ------------------------------------------------------------------
-    # 3. Сравнение моделей (XGBoost, NeuralProphet, LSTM)
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("ШАГ 3: СРАВНЕНИЕ МОДЕЛЕЙ")
-    print("=" * 60)
-
-    comparator = ModelComparison(model_save_dir=config.MODEL_SAVE_DIR)
-    comparator.run(train, val, test, include_prophet=not args.fast)
-    comparator.save_best()
-
-    plot_all_forecasts(train, val, test, predictions_dict=comparator.predictions_,
-                       save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_full.png"),
-                       zoom=False)
-    plot_all_forecasts(train, val, test, predictions_dict=comparator.predictions_,
-                       save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_zoom.png"),
-                       zoom=True)
-
-    # ------------------------------------------------------------------
-    # 4. XGBoost: доверительный интервал + важность признаков
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("ШАГ 4: ДОВЕРИТЕЛЬНЫЙ ИНТЕРВАЛ И ВАЖНОСТЬ ПРИЗНАКОВ")
-    print("=" * 60)
-
-    builder = comparator._builder  # тот же builder что обучал модели
+    builder = FeatureBuilder()
     (X_train, y_train), (X_val, y_val), (X_test, y_test) = \
         builder.transform_splits(train, val, test)
 
-    model = comparator.models_.get("XGBoost") or \
-            joblib.load(os.path.join(config.MODEL_SAVE_DIR, "xgboost.pkl"))
+    # --- Обучение XGBoost ---
+    print("--- XGBoost ---")
+    os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
+    xgb_save = os.path.join(config.MODEL_SAVE_DIR, "xgboost.pkl")
+    model = train_xgboost(
+        X_train, y_train, X_val, y_val,
+        n_estimators=config.XGB_N_ESTIMATORS,
+        max_depth=config.XGB_MAX_DEPTH,
+        learning_rate=config.XGB_LEARNING_RATE,
+        early_stopping_rounds=config.XGB_EARLY_STOPPING,
+        save_path=xgb_save,
+    )
+    preds = predict_xgboost(model, X_test)
+    evaluate(y_test.values, preds, "XGBoost", verbose=True)
+
+    # --- Доверительный интервал ---
+    print("\nОбучение квантильных моделей (доверительный интервал)...")
+    lower, upper = get_confidence_interval(
+        X_train, y_train, X_val, y_val, X_test,
+        save_dir=config.MODEL_SAVE_DIR,
+    )
+
+    # --- Важность признаков ---
+    imp_df = feature_importance(model, feature_names=list(X_train.columns))
+    print("\nТоп-5 важных признаков:")
+    print(imp_df.head(5).to_string(index=False))
+
+    # --- Графики ---
+    plot_forecast(
+        train, val, test, preds, "XGBoost", lower=lower, upper=upper,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "forecast_xgboost_full.png"),
+        zoom=False,
+    )
+    plot_forecast(
+        train, val, test, preds, "XGBoost", lower=lower, upper=upper,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "forecast_xgboost_zoom.png"),
+        zoom=True,
+    )
+
+    # --- Детекция пиков ---
+    _run_peak_detection(train, y_test, preds)
+
+    # --- CSV экспорт ---
+    metrics = {"model": "XGBoost"}
+    from evaluation.metrics import safe_mape
+    from sklearn.metrics import mean_absolute_error
+    metrics["MAE"] = float(mean_absolute_error(y_test.values, preds))
+    metrics["MAPE"] = safe_mape(y_test.values, preds)
+    pd.DataFrame([metrics]).to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "metrics_comparison.csv"), index=False
+    )
+
+    pred_df = test[["ds", "y"]].iloc[:len(preds)].copy().reset_index(drop=True)
+    pred_df["XGBoost"] = preds
+    pred_df["XGBoost_lower"] = lower[:len(pred_df)]
+    pred_df["XGBoost_upper"] = upper[:len(pred_df)]
+    pred_df.to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "predictions.csv"), index=False
+    )
+
+    imp_df.to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "feature_importance.csv"), index=False
+    )
+
+    print(f"\nМодель сохранена: {xgb_save}")
+    print(f"Графики и CSV: {config.MODEL_SAVE_DIR}/")
+
+
+# ---------------------------------------------------------------------------
+# Режим: сравнение всех моделей
+# ---------------------------------------------------------------------------
+
+def mode_compare(args):
+    df = load_data(use_synthetic=args.synthetic)
+    train, val, test = split_train_val_test(
+        df,
+        test_hours=config.SPLIT_TEST_HOURS,
+        val_hours=config.SPLIT_VAL_HOURS,
+    )
+    print(f"Train={len(train)}, Val={len(val)}, Test={len(test)}\n")
+
+    comparator = ModelComparison(model_save_dir=config.MODEL_SAVE_DIR)
+    comparator.run(
+        train, val, test,
+        include_prophet=not args.fast,
+        include_lstm=not args.fast,
+    )
+
+    # Сохраняем лучшую модель
+    comparator.save_best()
+
+    # Детекция пиков с лучшей моделью
+    winner_name, winner_model = comparator.best_model()
+    if winner_name == "XGBoost" and winner_model is not None:
+        builder = FeatureBuilder()
+        X_test, y_test = builder.get_X_y(test)
+        preds = winner_model.predict(X_test)
+        _run_peak_detection(train, y_test, preds)
+
+
+# ---------------------------------------------------------------------------
+# Режим: симуляция (реальное время)
+# ---------------------------------------------------------------------------
+
+def mode_simulate(args):
+    model_path = os.path.join(config.MODEL_SAVE_DIR, "xgboost.pkl")
+    if not os.path.exists(model_path):
+        print("Модель не найдена. Запустите сначала: python main.py train")
+        sys.exit(1)
+
+    model = joblib.load(model_path)
+    scaler = MomentumScaler()
+    builder = FeatureBuilder()
+    detector = PeakDetector(
+        method=config.PEAK_METHOD,
+        k=config.PEAK_K,
+        target_rps_per_replica=config.TARGET_LOAD_PER_REPLICA,
+        min_replicas=config.MIN_REPLICAS,
+        max_replicas=config.MAX_REPLICAS,
+        warning_ratio=config.ALERT_WARNING_RATIO,
+        critical_ratio=config.ALERT_CRITICAL_RATIO,
+    )
+
+    use_synthetic = args.synthetic
+    print("Запуск симуляции проактивного масштабирования (Ctrl+C для остановки)...")
+    iteration = 0
+
+    while True:
+        try:
+            df = load_data(use_synthetic=use_synthetic, days=2)
+
+            if len(df) < 30:
+                print("Недостаточно данных, ожидание...")
+                time.sleep(60)
+                continue
+
+            # Инициализируем детектор по последним 24ч
+            history = df.iloc[:-1]["y"]
+            detector.fit(history)
+
+            X = builder.get_X(df)
+            if len(X) == 0:
+                time.sleep(60)
+                continue
+
+            next_load = float(predict_xgboost(model, X.iloc[[-1]])[0])
+            current_load = float(df["y"].iloc[-1])
+
+            event = detector.detect(
+                predicted_rps=next_load,
+                current_rps=current_load,
+                timestamp=pd.Timestamp.now(),
+            )
+            print(f"\n[{iteration}] {event}")
+            scaler.scale(next_load)
+
+            iteration += 1
+            time.sleep(60)
+
+        except KeyboardInterrupt:
+            print("\nСимуляция остановлена.")
+            break
+        except Exception as e:
+            print(f"Ошибка: {e}")
+            time.sleep(30)
+
+
+# ---------------------------------------------------------------------------
+# Режим: полный демонстрационный пайплайн (без Prometheus)
+# ---------------------------------------------------------------------------
+
+def mode_demo(args):
+    """
+    Полный пайплайн на синтетических данных:
+    1. Генерация данных
+    2. Сравнение моделей
+    3. Доверительный интервал XGBoost
+    4. Детекция пиков
+    5. График
+    """
+    print("=" * 60)
+    print("ДЕМОНСТРАЦИОННЫЙ РЕЖИМ (синтетические данные)")
+    print("=" * 60)
+
+    from data_collection.synthetic_data import generate_synthetic_traffic
+
+    df = generate_synthetic_traffic(
+        days=config.SYNTHETIC_DAYS,
+        freq=config.SYNTHETIC_FREQ,
+        base_rps=config.SYNTHETIC_BASE_RPS,
+        noise_std=config.SYNTHETIC_NOISE_STD,
+        peak_probability=config.SYNTHETIC_PEAK_PROB,
+        peak_multiplier=config.SYNTHETIC_PEAK_MULTIPLIER,
+    )
+    print(f"\nДанные: {len(df)} точек, "
+          f"RPS min={df['y'].min():.0f} max={df['y'].max():.0f}\n")
+
+    train, val, test = split_train_val_test(
+        df,
+        test_hours=config.SPLIT_TEST_HOURS,
+        val_hours=config.SPLIT_VAL_HOURS,
+    )
+
+    # Сравнение моделей
+    comparator = ModelComparison(model_save_dir=config.MODEL_SAVE_DIR)
+    comparator.run(train, val, test,
+                   include_prophet=not args.fast,
+                   include_lstm=not args.fast)
+    comparator.save_best()
+
+    # XGBoost + доверительный интервал
+    builder = FeatureBuilder()
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = \
+        builder.transform_splits(train, val, test)
+
+    model = joblib.load(os.path.join(config.MODEL_SAVE_DIR, "xgboost.pkl"))
     preds = predict_xgboost(model, X_test)
 
     lower, upper = get_confidence_interval(
         X_train, y_train, X_val, y_val, X_test,
         save_dir=config.MODEL_SAVE_DIR,
     )
+
+    plot_forecast(
+        train, val, test, preds, "XGBoost",
+        lower=lower, upper=upper,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "forecast_xgboost_full.png"),
+        zoom=False,
+    )
+    plot_forecast(
+        train, val, test, preds, "XGBoost",
+        lower=lower, upper=upper,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "forecast_xgboost_zoom.png"),
+        zoom=True,
+    )
+
+    # Детекция пиков
+    summary = _run_peak_detection(train, y_test, preds)
+    print(f"\nИтог детекции пиков: {summary}")
+
+    # Важность признаков
     imp_df = feature_importance(model, feature_names=list(X_train.columns))
-    print("\nТоп-5 важных признаков:")
-    print(imp_df.head(5).to_string(index=False))
+    print("\nВажность признаков (XGBoost):")
+    print(imp_df.to_string(index=False))
 
-    plot_forecast(train, val, test, preds, "XGBoost", lower=lower, upper=upper,
-                  save_path=os.path.join(config.MODEL_SAVE_DIR, "forecast_xgboost.png"))
+    # --- Сравнительный график всех моделей ---
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models_full.png"),
+        zoom=False,
+    )
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models_zoom.png"),
+        zoom=True,
+    )
 
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # 5→6. Детекция пиков (IF + пороговый классификатор)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("ШАГ 6: ДЕТЕКЦИЯ ПИКОВ")
+    # --- CSV-экспорт для Typst / внешних инструментов ---
+    # 1. Метрики сравнения моделей
+    metrics_rows = [
+        {"model": name, **m}
+        for name, m in comparator.results_.items()
+    ]
+    pd.DataFrame(metrics_rows).to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "metrics_comparison.csv"), index=False
+    )
+    print(f"\nСохранено: saved_models/metrics_comparison.csv")
+
+    # 2. Предсказания всех моделей на тестовом периоде
+    min_len = min(len(test), len(lower), len(upper),
+                  *[len(p) for p in comparator.predictions_.values()])
+    pred_df = test[["ds", "y"]].iloc[:min_len].copy().reset_index(drop=True)
+    for name, model_preds in comparator.predictions_.items():
+        pred_df[name] = np.array(model_preds[:min_len])
+    pred_df["XGBoost_lower"] = lower[:min_len]
+    pred_df["XGBoost_upper"] = upper[:min_len]
+    pred_df.to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "predictions.csv"), index=False
+    )
+    print(f"Сохранено: saved_models/predictions.csv")
+
+    # 3. Важность признаков
+    imp_df.to_csv(
+        os.path.join(config.MODEL_SAVE_DIR, "feature_importance.csv"), index=False
+    )
+    print(f"Сохранено: saved_models/feature_importance.csv")
+
+
+# ---------------------------------------------------------------------------
+# Режим: обучение на готовом CSV (web_traffic.csv)
+# ---------------------------------------------------------------------------
+
+def mode_csv(args) -> None:
+    """
+    Полный пайплайн на данных Code/data/web_traffic.csv.
+    Не требует Prometheus, Docker или интернета.
+
+    Данные: 8760 точек, шаг 1ч, 2023-01-01 — 2023-12-31.
+    Колонки: timestamp, rps, concurrent_users, cpu_usage, memory_usage, latency_ms.
+    """
+    from data_collection.csv_loader import load_web_traffic, describe_csv
+
+    print("=" * 60)
+    print("ОБУЧЕНИЕ НА ДАННЫХ: Code/data/web_traffic.csv")
     print("=" * 60)
 
-    # Изолирующий лес обучается на остатке обучающей выборки
-    anomaly_det = ResidualAnomalyDetector(
-        contamination=getattr(config, "IF_CONTAMINATION", 0.05),
-    )
-    anomaly_det.fit(train_stats["residual"].values)
-    anomaly_det.save(config.MODEL_SAVE_DIR)
-    print(f"  IF обучен на {len(train_stats['residual'])} остатках")
+    # --- Загрузка ---
+    if args.path:
+        from data_collection.csv_loader import load_csv
+        df = load_csv(
+            args.path,
+            timestamp_col=args.timestamp_col or None,
+            value_col=args.value_col or None,
+        )
+    else:
+        df = load_web_traffic(months=args.months)
 
+    n = len(df)
+    print(f"\nЗагружено {n} точек | "
+          f"RPS: min={df['y'].min():.0f}  max={df['y'].max():.0f}  "
+          f"mean={df['y'].mean():.0f}")
+    print(f"Период: {df['ds'].iloc[0]}  ->  {df['ds'].iloc[-1]}\n")
+
+    if n < 200:
+        print("Недостаточно данных. Укажите --months больше или проверьте файл.")
+        sys.exit(1)
+
+    # --- Разбиение: для 1h данных используем часы напрямую ---
+    # 48ч теста + 48ч валидации, остальное — обучение
+    TEST_H  = min(480, n // 6)   # ~20% но не более 480ч (20 дней)
+    VAL_H   = TEST_H
+
+    train, val, test = split_train_val_test(df, test_hours=TEST_H, val_hours=VAL_H)
+    print(f"Split: train={len(train)}ч  val={len(val)}ч  test={len(test)}ч\n")
+
+    # --- Сравнение моделей ---
+    comparator = ModelComparison(model_save_dir=config.MODEL_SAVE_DIR)
+    comparator.run(train, val, test,
+                   include_prophet=not args.fast,
+                   include_lstm=not args.fast)
+    comparator.save_best()
+
+    # --- XGBoost: доверительный интервал + важность признаков ---
+    builder = FeatureBuilder()
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = \
+        builder.transform_splits(train, val, test)
+
+    xgb_path = os.path.join(config.MODEL_SAVE_DIR, "xgboost.pkl")
+    model = joblib.load(xgb_path)
+    preds = predict_xgboost(model, X_test)
+
+    print("\nОбучение квантильных моделей (доверительный интервал)...")
+    lower, upper = get_confidence_interval(
+        X_train, y_train, X_val, y_val, X_test,
+        save_dir=config.MODEL_SAVE_DIR,
+    )
+
+    # --- Важность признаков ---
+    imp_df = feature_importance(model, feature_names=list(X_train.columns))
+    print("\nВажность признаков (XGBoost gain):")
+    print(imp_df.to_string(index=False))
+
+    # --- Графики ---
+    xgb_plot_path = os.path.join(config.MODEL_SAVE_DIR, "forecast_csv.png") if args.save_plots else None
+    plot_forecast(
+        train, val, test, preds, "XGBoost (web_traffic.csv)",
+        lower=lower, upper=upper,
+        save_path=xgb_plot_path,
+    )
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models.png"),
+        zoom=False,
+    )
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models_zoom.png"),
+        zoom=True,
+    )
+
+    # --- Детекция пиков ---
+    # При 1h данных TARGET_LOAD_PER_REPLICA нужно перевести в реальный масштаб
+    # web_traffic.csv: RPS 400-1300, конфиг: TARGET=10 (для Litestar). Пересчитываем:
+    rps_max = float(train["y"].max())
+    target_per_replica = rps_max / config.MAX_REPLICAS
     detector = PeakDetector(
-        target_rps_per_replica=float(train["y"].max()) / config.MAX_REPLICAS,
+        method=config.PEAK_METHOD,
+        k=config.PEAK_K,
+        target_rps_per_replica=target_per_replica,
         min_replicas=config.MIN_REPLICAS,
         max_replicas=config.MAX_REPLICAS,
     )
     detector.fit(train["y"])
     predicted_series = pd.Series(preds, index=y_test.index)
-    _recompute = getattr(config, "PEAK_RECOMPUTE_EVERY", None)
-    events_df = detector.detect_series(y_test, predicted_series, recompute_every=_recompute)
+    events_df = detector.detect_series(y_test, predicted_series)
     summary = detector.summary(events_df)
 
-    # IF классифицирует природу пика и корректирует число реплик
-    test_residual = test_stats["residual"].reindex(
-        pd.DatetimeIndex(events_df["timestamp"])
-    ).fillna(0).values
-    events_df["is_anomaly"] = anomaly_det.predict(test_residual)
-
-    # Для аномальных точек пересчитываем реплики с коэффициентом запаса
-    k_safety = getattr(config, "IF_SAFETY_FACTOR", 1.2)
-    anomaly_mask = events_df["is_anomaly"]
-    if anomaly_mask.any():
-        events_df.loc[anomaly_mask, "recommended_replicas"] = (
-            events_df.loc[anomaly_mask, "predicted"]
-            .apply(lambda pred: detector._calculate_replicas(pred * k_safety))
-        )
-
-    print(f"  Метод: adaptive_percentile  порог={summary['threshold']:.0f} RPS")
+    print(f"\n--- Детекция пиков ---")
+    print(f"  Метод: {config.PEAK_METHOD}  "
+          f"порог={summary['threshold']:.0f} RPS  "
+          f"(= среднее + {config.PEAK_K}σ за 24ч)")
     print(f"  Пиков: {summary['peaks_detected']} / {summary['total_points']} "
           f"({summary['peak_ratio_pct']}%)")
     print(f"  Уровни severity: {summary['severity_counts']}")
-    n_anomaly = int(events_df["is_anomaly"].sum())
-    print(f"  Аномальных пиков (IF): {n_anomaly}")
 
     if events_df["is_peak"].any():
-        print(f"\n  Первые 5 пиков:")
-        for _, row in events_df[events_df["is_peak"]].head(5).iterrows():
-            anomaly_tag = " [ANOMALY]" if row.get("is_anomaly") else ""
-            print(f"    {row['timestamp']}  факт={row['rps']:.0f}  "
+        top5 = events_df[events_df["is_peak"]].head(5)
+        print(f"\n  Первые 5 пиков на тестовом периоде:")
+        for _, row in top5.iterrows():
+            print(f"    {row['timestamp']}  RPS факт={row['rps']:.0f}  "
                   f"прогноз={row['predicted']:.0f}  "
-                  f"[{row['severity']}]{anomaly_tag}  реплик={row['recommended_replicas']}")
+                  f"[{row['severity']}]  реплик={row['recommended_replicas']}")
 
-    plot_peaks(events_df, summary,
-               save_path=os.path.join(config.MODEL_SAVE_DIR, "peaks.png"),
-               max_replicas=config.MAX_REPLICAS)
+    print(f"\nМодели сохранены в {config.MODEL_SAVE_DIR}/")
 
-    # ------------------------------------------------------------------
-    # 6b. Многошаговый прогноз (recursive, горизонт H из config)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("ШАГ 6b: МНОГОШАГОВЫЙ ПРОГНОЗ")
-    print("=" * 60)
 
-    _horizons = getattr(config, "FORECAST_HORIZONS_PERIODS", [3, 6, 12])
-    H = _horizons[1]  # 30 мин при шаге 5 мин
-    history_ms = pd.concat([train, val, test]).sort_values("ds").reset_index(drop=True)
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 
-    # Восстанавливаем экзогенные колонки, если cleaner их не сохранил
-    _exog_cols = getattr(config, "EXOG_COLS", [])
-    for _col in _exog_cols:
-        if _col not in history_ms.columns:
-            if _col in df.columns:
-                _col_map = df.drop_duplicates("ds").set_index("ds")[_col]
-                history_ms[_col] = history_ms["ds"].map(_col_map).fillna(0).astype(int)
-            else:
-                history_ms[_col] = 0
-
-    # Экзогенные для горизонта прогноза: генерируем H строк с нулями
-    # (calendar flags = 0 означает «обычный день без событий»)
-    _last_ts = pd.to_datetime(history_ms["ds"].iloc[-1])
-    _step_sec = history_ms["ds"].diff().dropna().dt.total_seconds().median()
-    _step_min = float(_step_sec / 60) if not np.isnan(_step_sec) else 1.0
-    _future_ts = pd.date_range(
-        start=_last_ts + pd.Timedelta(minutes=_step_min),
-        periods=H, freq=f"{int(_step_min)}min",
+def _run_peak_detection(train, y_test, preds) -> dict:
+    """Инициализирует детектор и выводит сводку по пикам."""
+    detector = PeakDetector(
+        method=config.PEAK_METHOD,
+        k=config.PEAK_K,
+        target_rps_per_replica=config.TARGET_LOAD_PER_REPLICA,
+        min_replicas=config.MIN_REPLICAS,
+        max_replicas=config.MAX_REPLICAS,
     )
-    _exog_cols = getattr(config, "EXOG_COLS", [])
-    exog_future = pd.DataFrame({"ds": _future_ts})
-    for _col in _exog_cols:
-        exog_future[_col] = 0
+    detector.fit(train["y"])
 
-    ms_forecast = recursive_forecast(
-        history_df=history_ms,
-        model=model,
-        predict_fn=predict_xgboost,
-        builder=builder,
-        horizon=H,
-        exog_future=exog_future,
+    predicted_series = pd.Series(preds, index=y_test.index)
+    events_df = detector.detect_series(y_test, predicted_series)
+
+    summary = detector.summary(events_df)
+    n_peaks = summary["peaks_detected"]
+    total = summary["total_points"]
+    threshold = summary["threshold"]
+    print(f"\n--- Детекция пиков ---")
+    print(f"  Метод: {config.PEAK_METHOD}, порог={threshold:.0f} RPS")
+    print(f"  Пиков: {n_peaks} из {total} точек ({summary['peak_ratio_pct']}%)")
+    print(f"  Уровни: {summary['severity_counts']}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Система прогнозирования пиковых нагрузок (ВКР)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    print(f"  Горизонт: H={H} шагов вперёд от конца тест-периода")
-    for _, r in ms_forecast.iterrows():
-        print(f"    {r['ds']}  ŷ={r['y_hat']:.1f} RPS")
+    sub = parser.add_subparsers(dest="mode", required=True)
 
-    ms_csv = os.path.join(config.MODEL_SAVE_DIR, "multistep_forecast.csv")
-    ms_forecast.to_csv(ms_csv, index=False)
+    # train
+    p_train = sub.add_parser("train", help="Обучить XGBoost и оценить")
+    p_train.add_argument("--synthetic", action="store_true",
+                         help="Использовать синтетические данные вместо Prometheus")
 
-    # График: хвост теста + многошаговый прогноз
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    _tail = test.tail(max(H * 4, 60))
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(_tail["ds"], _tail["y"], color="steelblue", linewidth=1.5, label="Факт (тест)")
-    ax.plot(ms_forecast["ds"], ms_forecast["y_hat"],
-            color="crimson", linewidth=1.8, linestyle="--",
-            marker="o", markersize=4, label=f"Прогноз H={H} шагов")
-    ax.axvline(test["ds"].iloc[-1], color="gray", linestyle=":", linewidth=1.0,
-               label="Граница известных данных")
-    ax.set_xlabel("Время")
-    ax.set_ylabel("RPS")
-    ax.set_title(f"Рекурсивный многошаговый прогноз (H={H} шагов вперёд)")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    _ms_path = os.path.join(config.MODEL_SAVE_DIR, "multistep_forecast.png")
-    plt.savefig(_ms_path, dpi=150)
-    plt.close()
-    print(f"  Сохранено: {_ms_path}")
+    # compare
+    p_cmp = sub.add_parser("compare", help="Сравнить все модели")
+    p_cmp.add_argument("--synthetic", action="store_true")
+    p_cmp.add_argument("--fast", action="store_true",
+                        help="Пропустить NeuralProphet и LSTM (ускоряет сравнение)")
 
-    # ------------------------------------------------------------------
-    # 7. Walk-forward валидация с адаптивным переобучением
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("ШАГ 7: WALK-FORWARD ВАЛИДАЦИЯ")
-    print("=" * 60)
+    # simulate
+    p_sim = sub.add_parser("simulate", help="Симуляция проактивного масштабирования")
+    p_sim.add_argument("--synthetic", action="store_true")
 
-    drift = ADWINDriftDetector(
-        delta=getattr(config, "ADWIN_DELTA", 0.002),
-        min_obs=getattr(config, "ADWIN_MIN_OBS", 30),
-        cooldown_n=getattr(config, "ADWIN_COOLDOWN_N", 20),
-        n_fresh=getattr(config, "ADWIN_N_FRESH", 0),
-        confirmation_n=getattr(config, "ADWIN_CONFIRMATION_N", 10),
+    # demo
+    p_demo = sub.add_parser("demo", help="Полный пайплайн на синтетических данных")
+    p_demo.add_argument("--fast", action="store_true",
+                         help="Пропустить NeuralProphet и LSTM")
+
+    # csv — обучение на реальном CSV (web_traffic.csv)
+    p_csv = sub.add_parser(
+        "csv",
+        help="Обучение на готовом CSV (Code/data/web_traffic.csv) — без Prometheus",
     )
-    wf_model, wf_best_params, _ = train_xgboost_random_search(
-        X_train, y_train, X_val, y_val,
-        save_path=os.path.join(config.MODEL_SAVE_DIR, "xgboost_wf.pkl"),
+    p_csv.add_argument(
+        "--path", default=None,
+        help="Путь к CSV-файлу (по умолчанию: ../Code/data/web_traffic.csv)",
+    )
+    p_csv.add_argument(
+        "--timestamp-col", default=None,
+        help="Имя колонки с датой/временем (по умолчанию: автоопределение)",
+    )
+    p_csv.add_argument(
+        "--value-col", default=None,
+        help="Имя колонки со значениями (по умолчанию: автоопределение первой числовой)",
+    )
+    p_csv.add_argument(
+        "--months", type=int, default=12,
+        help="Сколько месяцев данных использовать (по умолчанию 12)",
+    )
+    p_csv.add_argument(
+        "--fast", action="store_true",
+        help="Пропустить NeuralProphet",
+    )
+    p_csv.add_argument(
+        "--save-plots", action="store_true",
+        help="Сохранить графики в saved_models/",
     )
 
-    # Гиперпараметры Prophet из шага сравнения (для refit без повторного grid-search)
-    prophet_params = None
-    if "Prophet" in comparator.models_:
-        prophet_params = getattr(comparator.models_["Prophet"], "_best_params", None)
+    return parser
 
-    wf_result = run_walk_forward(
-        train=train, val=val, test=test,
-        initial_model=wf_model,
-        predict_fn=predict_xgboost_wf,
-        train_fn=make_multi_model_train_fn(
-            builder,
-            save_dir=config.MODEL_SAVE_DIR,
-            xgb_params=wf_best_params,
-            prophet_best_params=prophet_params,
-            include_lstm=False,
-            include_prophet=False,
-        ),
-        builder=builder,
-        drift_detector=drift,
-        save_dir=config.MODEL_SAVE_DIR,
-        cleaner=cleaner,
-    )
-    wf_s = wf_result["summary"]
-    print(f"  MAE адаптивная:   {wf_s['mae_adaptive']}")
-    print(f"  MAE фиксированная:{wf_s['mae_baseline']}")
-    print(f"  Улучшение:        {wf_s['improvement_pct']}%")
-    print(f"  Переобучений:     {wf_s['n_retrains']}")
 
-    # --- График: все статичные модели + адаптивная vs факт ---
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
 
-    wf_df = wf_result["results_df"]
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(test["ds"], test["y"], color="#27ae60", linewidth=2,
-            label="Факт (тест)", zorder=5)
-    _colors = ["#e74c3c", "#9b59b6", "#e67e22"]
-    for (name, preds), col in zip(comparator.predictions_.items(), _colors):
-        ax.plot(test["ds"].values[:len(preds)],
-                np.clip(preds[:len(test)], 0, None),
-                color=col, linestyle="--", linewidth=1.2,
-                label=f"{name} (статичная)", alpha=0.8)
-    ax.plot(pd.to_datetime(wf_df["timestamp"]), wf_df["y_pred"],
-            color="steelblue", linewidth=1.5,
-            label="Адаптивная (walk-forward)", zorder=4)
-    for ts in wf_s["retrain_timestamps"]:
-        ax.axvline(ts, color="crimson", linestyle=":", linewidth=0.8, alpha=0.6)
-    ax.set_xlabel("Время")
-    ax.set_ylabel("RPS")
-    ax.set_title("Сравнение моделей и адаптивной системы на тест-периоде")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-    _cmp_path = os.path.join(config.MODEL_SAVE_DIR, "comparison_vs_adaptive.png")
-    plt.savefig(_cmp_path, dpi=150)
-    plt.close()
-    print(f"  Сохранено: {_cmp_path}")
+    os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 8. Экспорт результатов
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("ШАГ 8: ЭКСПОРТ РЕЗУЛЬТАТОВ")
-    print("=" * 60)
-
-    export_metrics_csv(comparator.results_, config.MODEL_SAVE_DIR)
-    export_predictions_csv(test, comparator.predictions_, lower, upper, config.MODEL_SAVE_DIR)
-    export_feature_importance_csv(imp_df, config.MODEL_SAVE_DIR)
-
-    print(f"\nВсё сохранено в {config.MODEL_SAVE_DIR}/")
-    print(f"  comparison_full.png      — сравнение всех моделей")
-    print(f"  forecast_xgboost.png     — прогноз XGBoost с CI")
-    print(f"  peaks.png                — детекция пиков")
-    print(f"  multistep_forecast.png   — многошаговый прогноз (H шагов вперёд)")
-    print(f"  multistep_forecast.csv   — значения многошагового прогноза")
-    print(f"  walk_forward_mae.png     — walk-forward валидация")
-    print(f"  metrics_summary.csv      — метрики всех моделей")
-    print(f"  predictions.csv          — прогнозы на тестовом периоде")
-    print(f"  feature_importance.csv   — важность признаков")
+    dispatch = {
+        "train":    mode_train,
+        "compare":  mode_compare,
+        "simulate": mode_simulate,
+        "demo":     mode_demo,
+        "csv":      mode_csv,
+    }
+    dispatch[args.mode](args)
 
 
 if __name__ == "__main__":
