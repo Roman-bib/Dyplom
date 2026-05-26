@@ -120,7 +120,7 @@ def main():
     print("ШАГ 4: ДОВЕРИТЕЛЬНЫЙ ИНТЕРВАЛ И ВАЖНОСТЬ ПРИЗНАКОВ")
     print("=" * 60)
 
-    builder = FeatureBuilder(exog_cols=config.EXOG_COLS)
+    builder = comparator._builder  # тот же builder что обучал модели
     (X_train, y_train), (X_val, y_val), (X_test, y_test) = \
         builder.transform_splits(train, val, test)
 

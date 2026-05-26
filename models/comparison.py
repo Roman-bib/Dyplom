@@ -68,7 +68,12 @@ class ModelComparison:
         self.models_: Dict[str, object] = {}
         self.predictions_: Dict[str, np.ndarray] = {}
         self.winner_: Optional[str] = None
-        self._builder = FeatureBuilder()
+        try:
+            import config as _cfg
+            _exog = getattr(_cfg, "EXOG_COLS", [])
+        except ImportError:
+            _exog = []
+        self._builder = FeatureBuilder(exog_cols=_exog)
 
     # ------------------------------------------------------------------
     # Публичный API
