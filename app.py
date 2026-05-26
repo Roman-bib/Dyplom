@@ -848,190 +848,177 @@ with tab_importance:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 7: АДАПТИВНОЕ ПЕРЕОБУЧЕНИЕ
+# TAB 7: АДАПТИВНОЕ ПЕРЕОБУЧЕНИЕ (walk-forward симуляция)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _find_drift_point(y: np.ndarray, scan_window: int) -> int:
-    """Индекс с максимальным скачком скользящего среднего."""
-    n = len(y)
-    min_pos = scan_window * 2
-    max_pos = n - scan_window * 2
-    if min_pos >= max_pos:
-        return n // 2
-    scores = np.array([
-        abs(np.mean(y[i : i + scan_window]) - np.mean(y[i - scan_window : i]))
-        for i in range(min_pos, max_pos)
-    ])
-    return min_pos + int(np.argmax(scores))
-
-
-def run_drift_comparison(df_full: pd.DataFrame) -> dict:
-    """
-    Находит участок с максимальным drift, обучает статичный и адаптивный
-    XGBoost, возвращает прогнозы и метрики для обоих.
-    """
-    y_all = df_full["y"].values
-    n = len(y_all)
-
-    step_sec = float(df_full["ds"].diff().dropna().dt.total_seconds().median())
-    step_min = max(1.0, step_sec / 60)
-    ppd = max(1, int(round(1440 / step_min)))   # точек в сутках
-
-    scan_w   = max(24, ppd)           # окно сканирования ~1 день
-    test_sz  = max(48, ppd * 3)       # тест ~3 дня
-    train_sz = max(200, ppd * 10)     # обучение ~10 дней
-
-    drift_i = _find_drift_point(y_all, scan_window=scan_w)
-    drift_i = max(train_sz * 2 + test_sz, drift_i)
-    drift_i = min(n - test_sz - scan_w, drift_i)
-
-    test_df = df_full.iloc[drift_i : drift_i + test_sz].reset_index(drop=True)
-
-    # Статичная: старые данные, далеко до drift
-    s_end   = max(train_sz, drift_i - train_sz - test_sz)
-    s_start = max(0, s_end - train_sz)
-    static_train = df_full.iloc[s_start : s_end].reset_index(drop=True)
-
-    # Адаптивная: данные непосредственно перед drift
-    a_start = max(0, drift_i - train_sz)
-    adapt_train = df_full.iloc[a_start : drift_i].reset_index(drop=True)
-
-    builder_d = FeatureBuilder()
-
-    def _fit_predict(train_df, test_df_inner):
-        val_n = max(10, len(train_df) // 5)
-        tr  = train_df.iloc[:-val_n].reset_index(drop=True)
-        val = train_df.iloc[-val_n:].reset_index(drop=True)
-        (Xtr, ytr), (Xv, yv), (Xte, yte) = builder_d.transform_splits(tr, val, test_df_inner)
-        m = train_xgboost(Xtr, ytr, Xv, yv, save_path=None)
-        return predict_xgboost(m, Xte), yte
-
-    static_preds, y_test = _fit_predict(static_train, test_df)
-    adapt_preds,  _      = _fit_predict(adapt_train,  test_df)
-
-    return dict(
-        drift_i        = drift_i,
-        test_df        = test_df,
-        y_test         = y_test,
-        static_preds   = static_preds,
-        adapt_preds    = adapt_preds,
-        static_metrics = evaluate(y_test.values, static_preds, verbose=False),
-        adapt_metrics  = evaluate(y_test.values, adapt_preds,  verbose=False),
-        static_train   = static_train,
-        adapt_train    = adapt_train,
-    )
-
-
 with tab_retrain:
-    st.subheader("Адаптивное переобучение: доказательство необходимости")
+    st.subheader("Адаптивное переобучение: walk-forward симуляция")
     st.caption(
-        "Алгоритм автоматически находит участок ряда с **максимальным смещением уровня** (concept drift), "
-        "обучает два XGBoost: **статичный** (на исторических данных вдали от drift) и "
-        "**адаптивный** (на данных непосредственно перед drift). "
-        "Разница в метриках количественно доказывает важность периодического переобучения."
+        "Система прогнозирует точку за точкой (walk-forward). При обнаружении "
+        "концепт-дрейфа через **ADWIN** или по счётчику **N_fresh** — модель "
+        "автоматически переобучается на накопленной истории. Параллельно идёт "
+        "фиксированная baseline-модель (без переобучений). "
+        "Это точная реализация алгоритма из блок-схемы (Рисунок 2.12 ВКР)."
     )
 
-    if st.button("🔍 Найти drift и сравнить модели", type="primary"):
-        with st.spinner("Поиск drift-участка и обучение двух моделей..."):
+    c1, c2, c3 = st.columns(3)
+    n_fresh_val = c1.slider(
+        "N_fresh: переобучение каждые N шагов",
+        min_value=0, max_value=500, value=200, step=10,
+        help="0 = только по ADWIN-сигналу (без принудительного)",
+    )
+    confirm_n_val = c2.slider(
+        "Подтверждение ADWIN (шагов подряд)",
+        min_value=3, max_value=30, value=10,
+        help="Защита от разовых пиков: retrain только если drift держится N шагов",
+    )
+    test_limit = c3.slider(
+        "Точек в тесте",
+        min_value=100, max_value=min(1000, len(test)),
+        value=min(400, len(test)), step=50,
+        help="Больше точек = дольше работает (~1-2 с на 100 точек)",
+    )
+
+    if trained is None or "XGBoost" not in trained.get("models", {}):
+        st.warning("⚠️ Сначала обучите **XGBoost** на вкладке «Сравнение моделей»")
+    elif st.button("▶ Запустить walk-forward", type="primary"):
+        with st.spinner("Walk-forward симуляция..."):
             try:
-                st.session_state["drift_res"] = run_drift_comparison(df)
+                from evaluation.walk_forward import run_walk_forward
+                from retraining.scheduler import make_xgb_train_fn
+                from retraining.drift_detector import ADWINDriftDetector
+                from models.forecasters import predict_xgboost_wf
+
+                builder_wf = FeatureBuilder()
+                drift_det  = ADWINDriftDetector(
+                    n_fresh=n_fresh_val,
+                    confirmation_n=confirm_n_val,
+                )
+                train_fn_wf = make_xgb_train_fn(builder_wf, save_dir=SAVE_DIR)
+                test_wf = test.iloc[:test_limit].reset_index(drop=True)
+
+                wf_res = run_walk_forward(
+                    train=train,
+                    val=val,
+                    test=test_wf,
+                    initial_model=trained["models"]["XGBoost"],
+                    predict_fn=predict_xgboost_wf,
+                    train_fn=train_fn_wf,
+                    builder=builder_wf,
+                    drift_detector=drift_det,
+                    save_dir=SAVE_DIR,
+                    verbose=False,
+                )
+                st.session_state["wf_res"] = wf_res
                 st.success("✅ Готово!")
             except Exception as e:
                 st.error(f"Ошибка: {e}")
 
-    drift_res = st.session_state.get("drift_res")
+    wf = st.session_state.get("wf_res")
 
-    if drift_res is not None:
-        sm           = drift_res["static_metrics"]
-        am           = drift_res["adapt_metrics"]
-        y_test_d     = drift_res["y_test"]
-        static_preds = drift_res["static_preds"]
-        adapt_preds  = drift_res["adapt_preds"]
-        test_df_d    = drift_res["test_df"]
-        static_train = drift_res["static_train"]
-        adapt_train  = drift_res["adapt_train"]
+    if wf is not None:
+        results_df  = wf["results_df"]
+        baseline_df = wf["baseline_df"]
+        summary     = wf["summary"]
+        retrain_ts  = summary["retrain_timestamps"]
 
-        # --- Метрики ---
-        st.subheader("Метрики на drift-участке")
-        rows_d = [
-            {"Модель": "Статичный (без переобучения)",
-             "MAE": round(sm["MAE"], 3), "RMSE": round(sm["RMSE"], 3), "MAPE, %": round(sm["MAPE"], 2)},
-            {"Модель": "Адаптивный (с переобучением)",
-             "MAE": round(am["MAE"], 3), "RMSE": round(am["RMSE"], 3), "MAPE, %": round(am["MAPE"], 2)},
-        ]
-        st.dataframe(pd.DataFrame(rows_d).set_index("Модель"), use_container_width=True)
-        dl(pd.DataFrame(rows_d), "drift_metrics.csv", "⬇ Метрики сравнения")
+        # --- Сводные метрики ---
+        st.subheader("Итоговые метрики")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("MAE адаптивная",    f"{summary['mae_adaptive']:.3f}")
+        c2.metric("MAE фиксированная", f"{summary['mae_baseline']:.3f}",
+                  delta=f"{summary['mae_adaptive'] - summary['mae_baseline']:+.3f}",
+                  delta_color="inverse")
+        c3.metric("Улучшение",         f"{summary['improvement_pct']:.1f}%")
+        c4.metric("Переобучений",       str(summary['n_retrains']))
 
-        improvement = (sm["MAPE"] - am["MAPE"]) / max(sm["MAPE"], 1e-6) * 100
-        if improvement > 1:
-            st.success(f"✅ Адаптивное переобучение улучшило MAPE на **{improvement:.1f}%** "
-                       f"({sm['MAPE']:.1f}% → {am['MAPE']:.1f}%)")
-        else:
-            st.info(f"ℹ️ Разница по MAPE: {improvement:.1f}%  (drift на этом ряду слабо выражен)")
+        # --- График 1: прогноз vs факт ---
+        st.subheader("Прогноз vs факт (walk-forward на тесте)")
+        merged = results_df.merge(baseline_df, on="timestamp", how="left")
 
-        # --- Полный ряд с выделением зон ---
-        st.subheader("Обзор ряда: зоны обучения и drift-окно")
-        fig_full = go.Figure()
-        fig_full.add_trace(go.Scatter(
-            x=df["ds"], y=df["y"], name="Факт",
-            line=dict(color="#3498db", width=1), opacity=0.55,
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=merged["timestamp"], y=merged["y_true"],
+            name="Факт", line=dict(color="#27ae60", width=1.5),
         ))
-        if len(static_train):
-            fig_full.add_vrect(
-                x0=static_train["ds"].iloc[0], x1=static_train["ds"].iloc[-1],
-                fillcolor="rgba(52,152,219,0.13)", line_width=0,
-                annotation_text="Стар. обучение", annotation_position="top left",
+        fig1.add_trace(go.Scatter(
+            x=merged["timestamp"], y=merged["y_pred"],
+            name=f"Адаптивная (MAE={summary['mae_adaptive']:.2f})",
+            line=dict(color="#3498db", width=1.5, dash="dash"),
+        ))
+        if "y_pred_baseline" in merged.columns:
+            fig1.add_trace(go.Scatter(
+                x=merged["timestamp"], y=merged["y_pred_baseline"],
+                name=f"Фиксированная (MAE={summary['mae_baseline']:.2f})",
+                line=dict(color="#e74c3c", width=1.2, dash="dot"),
+            ))
+        for i, ts in enumerate(retrain_ts):
+            fig1.add_vline(
+                x=ts, line_dash="dot", line_color="crimson",
+                line_width=1.2, opacity=0.65,
+                annotation_text="↺ retrain" if i == 0 else "↺",
+                annotation_position="top",
             )
-        if len(adapt_train):
-            fig_full.add_vrect(
-                x0=adapt_train["ds"].iloc[0], x1=adapt_train["ds"].iloc[-1],
-                fillcolor="rgba(39,174,96,0.18)", line_width=0,
-                annotation_text="Адапт. обучение", annotation_position="top left",
-            )
-        if len(test_df_d):
-            fig_full.add_vrect(
-                x0=test_df_d["ds"].iloc[0], x1=test_df_d["ds"].iloc[-1],
-                fillcolor="rgba(231,76,60,0.20)", line_width=0,
-                annotation_text="Drift / тест", annotation_position="top right",
-            )
-        fig_full.update_layout(
-            height=300, title="Полный ряд: зоны обучения и тест",
+        fig1.update_layout(
+            height=420, hovermode="x unified",
             xaxis_title="Время", yaxis_title=value_col,
-            hovermode="x unified", legend=dict(orientation="h", y=1.12),
+            legend=dict(orientation="h", y=1.12),
+            title="Walk-forward: адаптивный vs фиксированный прогноз  (↺ = переобучение)",
         )
-        st.plotly_chart(fig_full, use_container_width=True)
+        st.plotly_chart(fig1, use_container_width=True)
 
-        # --- Zoom: оба прогноза на drift-участке ---
-        st.subheader("Прогноз на drift-участке: статичная vs адаптивная")
-        n_d = min(len(test_df_d), len(y_test_d), len(static_preds), len(adapt_preds))
-        ds_d = test_df_d["ds"].values[:n_d]
+        # --- График 2: скользящая MAE ---
+        st.subheader("Скользящая MAE: адаптивная vs фиксированная")
+        roll_w = max(12, len(results_df) // 20)
+        roll_adapt = results_df["mae"].rolling(roll_w, min_periods=1).mean()
+        roll_base  = baseline_df["mae_baseline"].rolling(roll_w, min_periods=1).mean()
 
-        fig_zoom = go.Figure()
-        fig_zoom.add_trace(go.Scatter(
-            x=ds_d, y=y_test_d.values[:n_d], name="Факт",
-            line=dict(color="#27ae60", width=2),
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=results_df["timestamp"], y=roll_adapt,
+            name="Адаптивная", line=dict(color="#3498db", width=2),
+            fill="tozeroy", fillcolor="rgba(52,152,219,0.08)",
         ))
-        fig_zoom.add_trace(go.Scatter(
-            x=ds_d, y=static_preds[:n_d],
-            name=f"Статичный  MAPE={sm['MAPE']:.1f}%",
-            line=dict(color="#e74c3c", width=1.8, dash="dash"),
+        fig2.add_trace(go.Scatter(
+            x=baseline_df["timestamp"], y=roll_base,
+            name="Фиксированная", line=dict(color="#e74c3c", width=2, dash="dash"),
         ))
-        fig_zoom.add_trace(go.Scatter(
-            x=ds_d, y=adapt_preds[:n_d],
-            name=f"Адаптивный MAPE={am['MAPE']:.1f}%",
-            line=dict(color="#9b59b6", width=1.8, dash="dot"),
-        ))
-        fig_zoom.update_layout(
-            height=400, title="Zoom: прогноз статичной и адаптивной модели",
-            xaxis_title="Время", yaxis_title=value_col,
-            hovermode="x unified", legend=dict(orientation="h", y=1.12),
+        for i, ts in enumerate(retrain_ts):
+            fig2.add_vline(
+                x=ts, line_dash="dot", line_color="crimson",
+                line_width=1.2, opacity=0.7,
+                annotation_text="retrain" if i == 0 else "",
+                annotation_position="top left",
+            )
+        fig2.update_layout(
+            height=320, hovermode="x unified",
+            xaxis_title="Время", yaxis_title=f"MAE (скользящее окно={roll_w})",
+            legend=dict(orientation="h", y=1.12),
+            title="Скользящая MAE: адаптивная vs фиксированная модель",
         )
-        st.plotly_chart(fig_zoom, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
 
-        export_d = pd.DataFrame({
-            "timestamp":      ds_d,
-            "fact":           y_test_d.values[:n_d].round(3),
-            "static_model":   static_preds[:n_d].round(3),
-            "adaptive_model": adapt_preds[:n_d].round(3),
-        })
-        dl(export_d, "drift_comparison.csv", "⬇ Экспорт прогнозов (drift-участок)")
+        # --- Таблица событий переобучения из audit-лога ---
+        if retrain_ts:
+            st.subheader(f"Лог переобучений ({len(retrain_ts)} событий)")
+            audit_path = os.path.join(SAVE_DIR, "walk_forward_log.csv")
+            if os.path.exists(audit_path):
+                audit_df = pd.read_csv(audit_path).tail(len(retrain_ts) + 5)
+                rename = {
+                    "timestamp": "Время",
+                    "reason": "Причина",
+                    "baseline_mae_before": "MAE до",
+                    "rolling_mae_before": "MAE скольз.",
+                    "new_baseline_mae": "MAE после",
+                    "train_size": "Размер истории",
+                    "duration_s": "Время (с)",
+                }
+                audit_df = audit_df.rename(columns=rename)
+                st.dataframe(audit_df.reset_index(drop=True), use_container_width=True)
+                dl(audit_df, "retrain_log.csv", "⬇ Лог переобучений")
+
+        # --- Экспорт результатов ---
+        export_wf = merged[
+            ["timestamp", "y_true", "y_pred", "mae", "mae_baseline", "retrain"]
+        ].round(3)
+        dl(export_wf, "walk_forward_results.csv", "⬇ Результаты walk-forward")

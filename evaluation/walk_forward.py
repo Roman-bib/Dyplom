@@ -139,6 +139,7 @@ def run_walk_forward(
         })
         baseline_records.append({
             "timestamp": current_ts,
+            "y_pred_baseline": y_pred_baseline,
             "mae_baseline": mae_baseline,
         })
 
