@@ -83,6 +83,7 @@ class ModelComparison:
         include_lstm: bool = True,
         lstm_window_size: int = 24,
         lstm_epochs: int = 80,
+        force_retrain: bool = False,
     ) -> Dict[str, dict]:
         """
         Обучает все модели и оценивает на test.
@@ -93,6 +94,7 @@ class ModelComparison:
         include_prophet  : включить Prophet (медленно)
         include_lstm     : включить LSTM (требует TensorFlow)
         lstm_window_size : размер окна для LSTM в периодах
+        force_retrain    : True — переобучить даже если сохранённые файлы есть
         """
         print("=" * 60)
         print("СРАВНЕНИЕ МОДЕЛЕЙ ПРОГНОЗИРОВАНИЯ")
@@ -108,23 +110,76 @@ class ModelComparison:
         )
 
         # --- 1. XGBoost (основная модель) ---
-        self._fit_xgboost(X_train, y_train, X_val, y_val,
-                          X_test, y_test, peak_threshold)
+        xgb_path = os.path.join(self.model_save_dir, "xgboost.pkl")
+        if not force_retrain and os.path.exists(xgb_path):
+            print("\n[1] XGBoost — загружаем сохранённую модель...")
+            model = joblib.load(xgb_path)
+            preds = predict_xgboost(model, X_test)
+            mae_train = float(np.mean(np.abs(y_train.values - predict_xgboost(model, X_train))))
+            mae_val   = float(np.mean(np.abs(y_val.values   - predict_xgboost(model, X_val))))
+            self._record("XGBoost", y_test, preds, peak_threshold, 0.0,
+                         model_obj=model,
+                         y_train_for_mase=np.concatenate([y_train.values, y_val.values]),
+                         mae_train=mae_train, mae_val=mae_val)
+        else:
+            self._fit_xgboost(X_train, y_train, X_val, y_val,
+                              X_test, y_test, peak_threshold)
 
         # --- 2. Prophet (опционально) ---
+        prophet_path = os.path.join(self.model_save_dir, "prophet.np")
         if include_prophet:
-            self._fit_prophet(train, val, test, y_test, peak_threshold)
+            if not force_retrain and os.path.exists(prophet_path):
+                print("\n[2] Prophet — загружаем сохранённую модель...")
+                try:
+                    from models.forecasters import load_prophet, predict_prophet
+                    final_model = load_prophet(
+                        os.path.join(self.model_save_dir, "prophet.json")
+                    )
+                    import config as _cfg
+                    _exog = [c for c in getattr(_cfg, "EXOG_COLS", [])
+                             if c in test.columns]
+                    future_reg = test[["ds"] + _exog].copy() if _exog else None
+                    prophet_pred_df = predict_prophet(
+                        final_model, periods=len(test),
+                        history_ds=train["ds"], future_regressors=future_reg,
+                    )
+                    preds = np.clip(prophet_pred_df["yhat"].values[:len(y_test)], 0, None)
+                    self._record("Prophet", y_test, preds, peak_threshold, 0.0,
+                                 model_obj=final_model,
+                                 y_train_for_mase=np.concatenate([train["y"].values, val["y"].values]))
+                except Exception as e:
+                    print(f"  Загрузка Prophet не удалась ({e}), переобучаем...")
+                    self._fit_prophet(train, val, test, y_test, peak_threshold)
+            else:
+                self._fit_prophet(train, val, test, y_test, peak_threshold)
 
         # --- 3. LSTM (опционально) ---
+        lstm_path = os.path.join(self.model_save_dir, "lstm.keras")
         if include_lstm:
-            self._fit_lstm(
-                train, val, test,
-                X_train, y_train, X_val, y_val,
-                X_test, y_test,
-                window_size=lstm_window_size,
-                epochs=lstm_epochs,
-                peak_threshold=peak_threshold,
-            )
+            if not force_retrain and os.path.exists(lstm_path):
+                print("\n[3] LSTM — загружаем сохранённую модель...")
+                try:
+                    from models.forecasters import LSTMArtifact, predict_lstm_aligned
+                    artifact = LSTMArtifact.load(os.path.join(self.model_save_dir, "lstm"))
+                    X_full = pd.concat([X_train, X_val, X_test])
+                    preds = predict_lstm_aligned(artifact, X_full=X_full, n_test=len(y_test))
+                    self._record("LSTM", y_test, preds, peak_threshold, 0.0,
+                                 model_obj=artifact,
+                                 y_train_for_mase=np.concatenate([y_train.values, y_val.values]))
+                except Exception as e:
+                    print(f"  Загрузка LSTM не удалась ({e}), переобучаем...")
+                    self._fit_lstm(train, val, test, X_train, y_train, X_val, y_val,
+                                   X_test, y_test, window_size=lstm_window_size,
+                                   epochs=lstm_epochs, peak_threshold=peak_threshold)
+            else:
+                self._fit_lstm(
+                    train, val, test,
+                    X_train, y_train, X_val, y_val,
+                    X_test, y_test,
+                    window_size=lstm_window_size,
+                    epochs=lstm_epochs,
+                    peak_threshold=peak_threshold,
+                )
 
         # --- Итоговая таблица и выбор победителя ---
         self.winner_ = self._select_winner()

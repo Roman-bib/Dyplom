@@ -307,6 +307,16 @@ def train_prophet(
     """
     from neuralprophet import NeuralProphet
     from sklearn.metrics import mean_absolute_error
+    import torch, neuralprophet as _np_pkg
+    # PyTorch 2.6 требует явной регистрации классов NeuralProphet для checkpoint-загрузки
+    try:
+        import neuralprophet.configure as _npcfg
+        torch.serialization.add_safe_globals([
+            getattr(_npcfg, c) for c in dir(_npcfg) if not c.startswith("_")
+            and isinstance(getattr(_npcfg, c), type)
+        ])
+    except Exception:
+        pass
 
     if "ds" not in train_df.columns or "y" not in train_df.columns:
         raise ValueError("train_df должен содержать колонки 'ds' и 'y'")
@@ -494,8 +504,16 @@ def save_prophet(model, path: str) -> None:
 
 def load_prophet(path: str):
     """Загружает NeuralProphet из torch-формата."""
+    import torch
+    import neuralprophet
     from neuralprophet import load_model as _np_load
     load_path = path.replace(".json", "") + ".np"
+    # PyTorch 2.6 изменил дефолт weights_only=True, что ломает NeuralProphet.
+    torch.serialization.add_safe_globals([
+        getattr(neuralprophet.configure, cls)
+        for cls in dir(neuralprophet.configure)
+        if not cls.startswith("_")
+    ])
     return _np_load(load_path)
 
 
