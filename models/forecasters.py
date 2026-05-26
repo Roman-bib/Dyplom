@@ -307,16 +307,11 @@ def train_prophet(
     """
     from neuralprophet import NeuralProphet
     from sklearn.metrics import mean_absolute_error
-    import torch, neuralprophet as _np_pkg
-    # PyTorch 2.6 требует явной регистрации классов NeuralProphet для checkpoint-загрузки
-    try:
-        import neuralprophet.configure as _npcfg
-        torch.serialization.add_safe_globals([
-            getattr(_npcfg, c) for c in dir(_npcfg) if not c.startswith("_")
-            and isinstance(getattr(_npcfg, c), type)
-        ])
-    except Exception:
-        pass
+    import torch
+    # PyTorch 2.6 изменил weights_only=True по умолчанию, что ломает NeuralProphet.
+    # Патчим torch.load на время обучения NeuralProphet.
+    _orig_torch_load = torch.load
+    torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 
     if "ds" not in train_df.columns or "y" not in train_df.columns:
         raise ValueError("train_df должен содержать колонки 'ds' и 'y'")
@@ -370,6 +365,8 @@ def train_prophet(
             best_mae   = mae
             best_model = m
             best_params = params
+
+    torch.load = _orig_torch_load  # восстанавливаем после NeuralProphet
 
     if verbose and best_params is not None:
         print(f"  Best NeuralProphet: {best_params}  →  val MAE={best_mae:.2f}")
