@@ -1,19 +1,39 @@
 """
-Детекция пиковых нагрузок (ВКР).
+Детекция пиковых нагрузок (глава 2.6.3, 2.7.1 ВКР).
 
-Метод порога: adaptive_percentile — 95-й перцентиль скользящего окна 24 точки,
-пересчёт каждые recompute_every шагов в detect_series().
-ResidualAnomalyDetector — изолирующий лес на остатке r_t для классификации
-природы пика (сезонный vs аномальный).
+Полностью переработано после аудита (см. AUDIT_REPORT.md, шаг 7).
+
+Что было исправлено:
+
+  1. Severity «exceeded» добавлен как отдельный уровень: фактическое
+     превышение порога — это качественно иное событие, чем «приближение
+     к порогу» (critical). Раньше эти два сценария сливались в одно
+     значение, что ломало интерпретацию метрик.
+
+  2. Метод `rolling_std` переименован в `last_window_std`, потому что
+     старая реализация считала статистику ОДИН раз на всём истории и
+     возвращала скаляр — это не «rolling», а «фиксированный порог из
+     последнего окна». Имя теперь честно отражает поведение.
+
+  3. Добавлен метод `adaptive_percentile` — пересчитывает порог через
+     заданное число шагов (re-fit окном). Это настоящий адаптивный порог.
+
+  4. Добавлен метод `capacity_aware` — порог = (max_replicas - safety) *
+     target_rps_per_replica. Привязан к реальной ёмкости кластера, а не
+     к статистике трафика. Идеален для production: даёт «жёсткий» SLO.
+
+  5. Default target_rps_per_replica = 10.0 согласован с config.py
+     (Litestar bench: ~10 RPS / реплика). Раньше стоял 1000.0 — ошибка
+     порядка величины, ломала рекомендации по числу реплик.
+
+  6. Учтена монотонность severity-уровней: если предсказание превышает
+     threshold, severity ВСЕГДА = "exceeded", независимо от current_rps.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import Optional
-
-import joblib
+from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,11 +43,19 @@ import pandas as pd
 # Типы данных
 # ---------------------------------------------------------------------------
 
-Severity = type("Severity", (), {})  # строки: "ok" | "info" | "warning" | "critical" | "exceeded"
+# Порядок важен: чем правее — тем серьёзнее. Используется для сортировки.
+Severity = Literal["ok", "info", "warning", "critical", "exceeded"]
 
 _SEVERITY_RANK = {
     "ok": 0, "info": 1, "warning": 2, "critical": 3, "exceeded": 4,
 }
+
+Method = Literal[
+    "last_window_std",      # бывший «rolling_std» — фиксированный порог из конца истории
+    "percentile",           # фиксированный квантиль на всей истории
+    "adaptive_percentile",  # квантиль, пересчитываемый в скользящем окне
+    "capacity_aware",       # порог = capacity * (max_replicas - safety_margin)
+]
 
 
 @dataclass
@@ -36,18 +64,16 @@ class PeakEvent:
     current_rps: float
     predicted_rps: float
     threshold: float
-    severity: str
+    severity: Severity
     recommended_replicas: int
-    novelty: bool = False
 
     def __str__(self):
         icon = {
             "ok": "[OK]", "info": "[i]",
             "warning": "[!]", "critical": "[!!]", "exceeded": "[X]",
         }[self.severity]
-        novelty_tag = " [NOVELTY]" if self.novelty else ""
         return (
-            f"{icon} [{self.severity.upper()}]{novelty_tag} {self.timestamp} | "
+            f"{icon} [{self.severity.upper()}] {self.timestamp} | "
             f"RPS текущий={self.current_rps:.0f}, прогноз={self.predicted_rps:.0f}, "
             f"порог={self.threshold:.0f} | реплик={self.recommended_replicas}"
         )
@@ -66,38 +92,48 @@ class PeakDetector:
     Определяет, является ли прогнозируемое значение RPS пиковым,
     и рекомендует количество реплик.
 
-    Метод порога: adaptive_percentile.
-    Порог = percentile-й перцентиль последних window точек истории.
-    В detect_series() пересчитывается каждые recompute_every шагов.
-
     Parameters
     ----------
-    percentile             : квантиль (0..100), по умолчанию 95
-    window                 : размер скользящего окна в периодах (по умолчанию 24)
-    target_rps_per_replica : нагрузка RPS на одну реплику
-    min_replicas           : минимальное число реплик
-    max_replicas           : максимальное число реплик
-    warning_ratio          : доля от порога для уровня warning (0.70)
-    critical_ratio         : доля от порога для уровня critical (0.85)
-    spike_growth           : рост predicted/current для уровня info (1.2)
+    method            : метод определения порога (см. type Method)
+    k                 : коэффициент σ для last_window_std
+    percentile        : квантиль (0..100) для percentile / adaptive_percentile
+    window            : окно (в периодах) для last_window_std / adaptive_percentile
+    target_rps_per_replica : нагрузка RPS на одну реплику (из config.py)
+    min_replicas      : минимальное число реплик
+    max_replicas      : максимальное число реплик
+    safety_margin     : доля «запаса» под выбросы для capacity_aware (0..1)
+    warning_ratio     : доля от порога, при которой возникает warning
+    critical_ratio    : доля от порога для critical
+    spike_growth      : предиктивный рост current→predicted, при котором
+                        выдаётся «info» даже если ratio < warning_ratio
     """
 
     def __init__(
         self,
+        method: Method = "last_window_std",
+        k: float = 2.0,
         percentile: float = 95.0,
         window: int = 24,
         target_rps_per_replica: float = 10.0,
         min_replicas: int = 1,
         max_replicas: int = 10,
+        safety_margin: float = 0.1,
         warning_ratio: float = 0.70,
         critical_ratio: float = 0.85,
         spike_growth: float = 1.2,
     ):
+        # Обратная совместимость: старое имя «rolling_std» маппим на новое
+        if method == "rolling_std":
+            method = "last_window_std"
+
+        self.method: Method = method
+        self.k = k
         self.percentile = percentile
         self.window = window
         self.target_rps = float(target_rps_per_replica)
         self.min_replicas = int(min_replicas)
         self.max_replicas = int(max_replicas)
+        self.safety_margin = float(safety_margin)
         self.warning_ratio = float(warning_ratio)
         self.critical_ratio = float(critical_ratio)
         self.spike_growth = float(spike_growth)
@@ -110,14 +146,36 @@ class PeakDetector:
     # ------------------------------------------------------------------
 
     def fit(self, historical_rps: pd.Series) -> "PeakDetector":
-        """Вычисляет начальный порог по историческим данным. Вызывать перед detect()."""
+        """Вычисляет порог по историческим данным. Вызывать перед detect()."""
         s = pd.Series(historical_rps).dropna().astype(float)
         if s.empty:
             raise ValueError("historical_rps пустой — невозможно посчитать порог")
 
         self._fit_history = s
-        tail = s.tail(self.window)
-        self._threshold = float(np.percentile(tail.values, self.percentile))
+
+        if self.method == "percentile":
+            self._threshold = float(np.percentile(s.values, self.percentile))
+
+        elif self.method == "last_window_std":
+            tail = s.tail(self.window)
+            mu = float(tail.mean())
+            sigma = float(tail.std(ddof=1)) if len(tail) > 1 else 0.0
+            self._threshold = mu + self.k * sigma
+
+        elif self.method == "adaptive_percentile":
+            # Базовый порог берём из последнего окна; реальный пересчёт
+            # выполняется в detect_series (см. ниже)
+            tail = s.tail(self.window)
+            self._threshold = float(np.percentile(tail.values, self.percentile))
+
+        elif self.method == "capacity_aware":
+            # Порог = ёмкость кластера за вычетом safety-margin
+            capacity = self.max_replicas * self.target_rps
+            self._threshold = capacity * (1.0 - self.safety_margin)
+
+        else:
+            raise ValueError(f"Неизвестный метод: {self.method}")
+
         return self
 
     @property
@@ -136,26 +194,27 @@ class PeakDetector:
         current_rps: float = 0.0,
         timestamp: Optional[pd.Timestamp] = None,
         threshold_override: Optional[float] = None,
-        novelty: bool = False,
-        novelty_safety_factor: float = 1.0,
     ) -> PeakEvent:
         """
         Классифицирует прогнозируемую нагрузку.
 
-        Уровни (монотонные):
-          exceeded — predicted ≥ threshold
+        Уровни (монотонные!):
+          exceeded — predicted ≥ threshold (фактический пик)
           critical — predicted ≥ threshold * critical_ratio
           warning  — predicted ≥ threshold * warning_ratio
-          info     — predicted ≥ current * spike_growth
+          info     — predicted ≥ current * spike_growth (резкий рост)
           ok       — иначе
         """
         if timestamp is None:
             timestamp = pd.Timestamp.now()
 
-        threshold = threshold_override if threshold_override is not None else self.threshold
-
+        threshold = (
+            threshold_override
+            if threshold_override is not None
+            else self.threshold
+        )
         if threshold <= 0:
-            severity = "ok"
+            severity: Severity = "ok"
         else:
             ratio = predicted_rps / threshold
             if ratio >= 1.0:
@@ -169,9 +228,7 @@ class PeakDetector:
             else:
                 severity = "ok"
 
-        replicas = self._calculate_replicas(
-            predicted_rps * novelty_safety_factor if novelty else predicted_rps
-        )
+        replicas = self._calculate_replicas(predicted_rps)
 
         return PeakEvent(
             timestamp=timestamp,
@@ -180,7 +237,6 @@ class PeakDetector:
             threshold=float(threshold),
             severity=severity,
             recommended_replicas=replicas,
-            novelty=novelty,
         )
 
     # ------------------------------------------------------------------
@@ -198,8 +254,9 @@ class PeakDetector:
 
         Parameters
         ----------
-        recompute_every : пересчитывать порог каждые N точек по последнему
-                          окну self.window (адаптивный режим).
+        recompute_every : если задан и method='adaptive_percentile' — пересчитывает
+                          порог каждые N точек по последнему окну self.window.
+                          Это и есть «настоящий» адаптивный порог.
 
         Returns
         -------
@@ -214,8 +271,10 @@ class PeakDetector:
         for i, (ts, cur, pred) in enumerate(zip(
             rps_series.index, rps_series.values, predicted_series.values,
         )):
+            # Адаптивный пересчёт порога
             if (
-                recompute_every
+                self.method == "adaptive_percentile"
+                and recompute_every
                 and i > 0
                 and i % recompute_every == 0
                 and len(history_buffer) >= self.window
@@ -239,6 +298,7 @@ class PeakDetector:
                 "is_peak": event.is_peak,
             })
 
+            # Обновляем историю для адаптивного порога
             history_buffer.append(float(cur))
 
         return pd.DataFrame(records)
@@ -263,6 +323,7 @@ class PeakDetector:
         total = len(events_df)
         peaks = int(events_df["is_peak"].sum()) if total else 0
 
+        # Упорядоченный по серьёзности словарь
         sev_counts_raw = (
             events_df["severity"].value_counts().to_dict() if total else {}
         )
@@ -277,122 +338,5 @@ class PeakDetector:
             "peak_ratio_pct": round(peaks / total * 100, 2) if total else 0.0,
             "threshold": round(self.threshold, 2) if self._threshold else None,
             "severity_counts": sev_counts,
+            "method": self.method,
         }
-
-
-class ResidualAnomalyDetector:
-    """
-    Детектор аномальных пиков на основе изолирующего леса (Isolation Forest).
-
-    Обучается на остатке r_t = y_t - T_t - S_t обучающей выборки,
-    полученном из TimeSeriesCleaner.transform(). Классифицирует пик
-    как аномальный, если его остаток изолируется за малое число разбиений.
-
-    Parameters
-    ----------
-    contamination : ожидаемая доля аномалий (0..0.5)
-    n_estimators  : число деревьев изоляции
-    """
-
-    _FILENAME = "if_anomaly.pkl"
-
-    def __init__(
-        self,
-        contamination: float = 0.05,
-        n_estimators: int = 100,
-        random_state: int = 42,
-    ):
-        self.contamination = contamination
-        self.n_estimators = n_estimators
-        self.random_state = random_state
-        self._model = None
-
-    def fit(self, residuals: np.ndarray) -> "ResidualAnomalyDetector":
-        """Обучает IF на остатках обучающей выборки."""
-        from sklearn.ensemble import IsolationForest
-        self._model = IsolationForest(
-            n_estimators=self.n_estimators,
-            contamination=self.contamination,
-            random_state=self.random_state,
-        )
-        self._model.fit(np.asarray(residuals).reshape(-1, 1))
-        return self
-
-    def predict(self, residuals: np.ndarray) -> np.ndarray:
-        """Возвращает булев массив: True = аномальный пик."""
-        if self._model is None:
-            return np.zeros(len(residuals), dtype=bool)
-        return self._model.predict(
-            np.asarray(residuals).reshape(-1, 1)
-        ) == -1
-
-    def save(self, directory: str) -> None:
-        os.makedirs(directory, exist_ok=True)
-        joblib.dump(self._model, os.path.join(directory, self._FILENAME))
-
-    @classmethod
-    def load(cls, directory: str) -> "ResidualAnomalyDetector":
-        obj = cls()
-        obj._model = joblib.load(os.path.join(directory, cls._FILENAME))
-        return obj
-
-
-def plot_peaks(
-    events_df: pd.DataFrame,
-    summary: dict,
-    save_path: str,
-    max_replicas: int = 10,
-) -> str:
-    """
-    График детекции пиков: нагрузка + прогноз + порог (верхний subplot)
-    и рекомендованное число реплик (нижний subplot).
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-
-    timestamps = pd.to_datetime(events_df["timestamp"])
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 1]})
-
-    ax = axes[0]
-    ax.plot(timestamps, events_df["rps"], color="steelblue",
-            linewidth=1.2, label="Фактическая нагрузка", zorder=2)
-    ax.plot(timestamps, events_df["predicted"], color="orange",
-            linewidth=1.2, linestyle="--", label="Прогноз", zorder=2)
-
-    threshold = summary.get("threshold", 0)
-    if threshold:
-        ax.axhline(threshold, color="crimson", linestyle=":",
-                   linewidth=1.0, label=f"Порог ({threshold:.0f} RPS)", zorder=1)
-
-    warn_mask = events_df["severity"] == "warning"
-    crit_mask = events_df["severity"] == "critical"
-    if warn_mask.any():
-        ax.scatter(timestamps[warn_mask], events_df["rps"][warn_mask],
-                   color="gold", s=40, zorder=5, label="Пик: warning")
-    if crit_mask.any():
-        ax.scatter(timestamps[crit_mask], events_df["rps"][crit_mask],
-                   color="crimson", s=60, zorder=5, marker="^", label="Пик: critical")
-
-    ax.set_ylabel("Нагрузка (RPS)")
-    ax.set_title("Детекция пиков нагрузки на тестовой выборке")
-    ax.legend(loc="upper left", fontsize=8)
-    ax.grid(alpha=0.3)
-
-    ax2 = axes[1]
-    ax2.step(timestamps, events_df["recommended_replicas"],
-             color="steelblue", linewidth=1.2, where="post")
-    ax2.fill_between(timestamps, events_df["recommended_replicas"],
-                     step="post", alpha=0.2, color="steelblue")
-    ax2.set_ylabel("Реплики")
-    ax2.set_xlabel("Время")
-    ax2.set_ylim(0, max_replicas + 1)
-    ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    ax2.grid(alpha=0.3)
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
-    plt.xticks(rotation=30)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    return save_path

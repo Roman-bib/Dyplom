@@ -1,9 +1,31 @@
 # =============================================================================
 # Конфигурация системы прогнозирования пиковых нагрузок (ВКР)
+# Стек мониторинга: github.com/artemonsh/grafana-deploy
 # =============================================================================
 
-# Параметры данных
-DEFAULT_STEP = "5min"               # шаг дискретизации: 1 точка каждые 5 минут
+# --- Prometheus ---
+PROMETHEUS_URL = "http://localhost:9090"
+PROMETHEUS_ACCESS_TOKEN = ""        # Bearer-токен (если требуется)
+
+# --- PromQL-запросы для метрик бэкенда grafana-deploy ---
+# Бэкенд: Litestar, метрика: litestar_requests_total{method,path,status_code}
+# rate() даёт скорость запросов/сек; sum() агрегирует по всем меткам.
+# Окно rate должно быть ≥ step (рекомендуется step * 2..3).
+PROMETHEUS_QUERY_RPS = "sum(rate(litestar_requests_total[5m]))"
+PROMETHEUS_QUERY_LATENCY_P99 = (
+    "histogram_quantile(0.99, "
+    "sum(rate(litestar_request_duration_seconds_bucket[5m])) by (le))"
+)
+PROMETHEUS_QUERY_ACTIVE = "sum(litestar_requests_in_progress)"
+
+# Псевдоним для обратной совместимости с main.py
+PROMETHEUS_QUERY = PROMETHEUS_QUERY_RPS
+
+# Параметры выгрузки исторических данных
+# step="5min": 1 точка каждые 5 минут = 288 точек/день = 2016 за неделю
+# Prometheus scrape_interval=3s, rate-окно 5m — хорошее соответствие.
+DEFAULT_STEP = "5min"
+DEFAULT_DAYS_AGO = 7               # глубина истории для обучения (дней)
 
 # --- Обучение ---
 MODEL_SAVE_DIR = "./saved_models"
@@ -27,10 +49,11 @@ XGB_MAX_DEPTH = 6
 XGB_LEARNING_RATE = 0.05
 XGB_EARLY_STOPPING = 20
 
-# --- Детекция пиков ---
-PEAK_PERCENTILE = 95.0              # квантиль скользящего окна
-PEAK_WINDOW_HOURS = 24              # окно (периодов) для расчёта перцентиля
-PEAK_RECOMPUTE_EVERY = 12           # пересчёт порога каждые N шагов
+# --- Детекция пиков (глава 2.7.1 ВКР) ---
+PEAK_METHOD = "rolling_std"         # "rolling_std" | "percentile"
+PEAK_K = 2.0                        # коэффициент σ при rolling_std
+PEAK_PERCENTILE = 95.0              # квантиль при методе percentile
+PEAK_WINDOW_HOURS = 24              # окно для rolling_std (часов → пересчитывается в периоды)
 
 # Пороги уровней алертов (доля от threshold)
 ALERT_WARNING_RATIO = 0.70          # ≥70% от порога → warning
@@ -43,32 +66,8 @@ MIN_REPLICAS = 1
 MAX_REPLICAS = 10
 SCALE_DOWN_BACKOFF = 300            # задержка уменьшения реплик (сек) = 5 минут
 
-# --- ADWIN детектор концепт-дрейфа (глава 2.7.2 ВКР) ---
-# delta=0.002 → P(ложное срабатывание) ≤ 0.2% (стандарт Bifet & Gavalda, 2007)
-ADWIN_DELTA = 0.002
-ADWIN_MIN_OBS = 30                  # минимум наблюдений перед первой проверкой
-ADWIN_COOLDOWN_N = 20               # минимум шагов между retrain-событиями
-ADWIN_CONFIRMATION_N = 10           # шагов подряд с дрейфом до ретрейна (отсекает пики)
-# N_fresh: принудительный retrain каждые N шагов (блок-схема Рисунок 2.7).
-# 0 = отключить. При DEFAULT_STEP=5min: 1440 шагов ≈ 5 суток.
-ADWIN_N_FRESH = 288
-
 # --- Порог переобучения (глава 2.6.4 ВКР) ---
 MAPE_RETRAIN_THRESHOLD = 20.0       # при MAPE > 20% инициировать переобучение
-
-# --- Праздники и события ---
-PROPHET_USE_HOLIDAYS = True         # передавать российские праздники в Prophet
-PROPHET_COUNTRY_CODE = "RU"        # ISO-код страны для add_country_holidays
-
-# --- Экзогенные метрики (дополнительные признаки для модели) ---
-# Колонки, которые FeatureBuilder добавит как lag_1h + mean_1h признаки.
-# При загрузке из Prometheus — заполняются отдельными запросами;
-# при синтетике — генерируются автоматически в synthetic_data.py.
-EXOG_COLS = ["is_campaign", "is_promo"]
-
-# --- Детектор аномальных пиков (Isolation Forest на остатке r_t) ---
-IF_CONTAMINATION = 0.05             # ожидаемая доля аномалий в обучающей выборке
-IF_SAFETY_FACTOR = 1.2              # коэффициент запаса реплик при аномальном пике
 
 # --- Синтетические данные (для демо без Prometheus) ---
 SYNTHETIC_DAYS = 30

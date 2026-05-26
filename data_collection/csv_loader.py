@@ -1,12 +1,17 @@
 """
 Загрузчик данных из CSV-файла.
 
-Читает CSV с временным рядом и приводит к стандартному формату {ds, y}.
+Читает web_traffic.csv, сгенерированный Code/ML.py (или любой CSV с временным рядом),
+и приводит к стандартному формату {ds, y}, ожидаемому всей системой.
 
 Поддерживаемые форматы:
-  - timestamp, rps, concurrent_users, ... (web_traffic.csv)
+  - Code/ML.py: timestamp, rps, concurrent_users, cpu_usage, memory_usage, latency_ms
+  - Prometheus export: колонка ds и любая y-колонка
   - Любой CSV с одной datetime-колонкой и одной числовой
   - Автоопределение колонок если timestamp_col/value_col не указаны
+
+Путь к данным по умолчанию: относительно proactive-scaler/
+  "../Code/data/web_traffic.csv"
 """
 
 from pathlib import Path
@@ -93,36 +98,18 @@ def load_csv(
             f"Колонка '{val_col}' не найдена. Доступные: {list(df.columns)}"
         )
 
-    print(f"  timestamp -> '{ts_col}',  value -> '{val_col}'")
+    print(f"  timestamp → '{ts_col}',  value → '{val_col}'")
 
     df[ts_col] = pd.to_datetime(df[ts_col])
     df = df.rename(columns={ts_col: "ds", val_col: "y"})
+    df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
 
-    # Сохраняем экзогенные колонки если они есть в CSV
-    try:
-        import config as _cfg
-        exog_cols = [c for c in getattr(_cfg, "EXOG_COLS", []) if c in df.columns]
-    except ImportError:
-        exog_cols = []
-    keep_cols = ["ds", "y"] + exog_cols
-    df = df[[c for c in keep_cols if c in df.columns]]
-    if exog_cols:
-        print(f"  Экзогенные признаки: {exog_cols}")
-
-    # Фильтр по дате до очистки, чтобы не интерполировать ненужные участки
     if start:
         df = df[df["ds"] >= pd.to_datetime(start)]
     if end:
         df = df[df["ds"] <= pd.to_datetime(end)]
 
-    # Полный пайплайн предобработки (Рисунок 2.2 ВКР):
-    # сортировка, удаление дубликатов, расчёт медианного шага τ,
-    # выравнивание на регулярную сетку, линейная интерполяция, float64
-    from preprocessing.data_cleaning import clean_timeseries
-    df, stats = clean_timeseries(df, ts_col="ds", value_col="y")
-    if stats.get("n_gaps_filled", 0) > 0:
-        print(f"  Заполнено разрывов: {stats['n_gaps_filled']} "
-              f"(шаг {stats['step_minutes']:.1f} мин)")
+    df["y"] = df["y"].astype("float64")
     return df.reset_index(drop=True)
 
 
@@ -158,102 +145,6 @@ def describe_csv(path: Optional[str] = None) -> None:
     print(f"Шаг:     {step}")
     print(f"RPS:     min={df['y'].min():.1f}  max={df['y'].max():.1f}  "
           f"mean={df['y'].mean():.1f}  std={df['y'].std():.1f}")
-
-
-def load_wiki_pageviews(path: str, top_n_pages: int = 50) -> pd.DataFrame:
-    """
-    Загружает датасет Wikipedia Web Traffic (Kaggle wide-format).
-
-    Формат входного файла:
-      - Первая колонка: Page (название страницы)
-      - Остальные колонки: даты в формате YYYYMMDDNN (напр. 2018010100)
-      - Значения: количество просмотров страницы в этот день
-
-    Выход: DataFrame {ds (datetime), y (float)} — суммарные просмотры
-    по top_n_pages самых популярных страниц за каждый день.
-
-    Parameters
-    ----------
-    path      : путь к CSV-файлу
-    top_n_pages : сколько страниц суммировать (None = все)
-    """
-    df_raw = pd.read_csv(path, index_col=0)
-
-    # Отбираем наиболее популярные страницы для стабильного сигнала
-    if top_n_pages is not None and top_n_pages < len(df_raw):
-        total_views = df_raw.sum(axis=1)
-        df_raw = df_raw.loc[total_views.nlargest(top_n_pages).index]
-
-    # Суммируем просмотры по всем страницам за каждый день
-    daily_views = df_raw.sum(axis=0)
-
-    # Парсим даты: YYYYMMDDNN → datetime (отбрасываем последние 2 символа NN)
-    dates = []
-    values = []
-    for col_name, val in daily_views.items():
-        date_str = str(col_name)[:8]   # YYYYMMDD
-        try:
-            dt = pd.to_datetime(date_str, format="%Y%m%d")
-            dates.append(dt)
-            values.append(float(val))
-        except ValueError:
-            continue
-
-    result = pd.DataFrame({"ds": dates, "y": values})
-    result = result.sort_values("ds").reset_index(drop=True)
-    result["y"] = result["y"].fillna(0.0)
-
-    print(f"  Wikipedia: {len(result)} дней, "
-          f"суммарные просмотры: min={result['y'].min():.0f}, "
-          f"max={result['y'].max():.0f}, mean={result['y'].mean():.0f}")
-    return result
-
-
-def load_faas_dataset(top_n_instances: int = None) -> pd.DataFrame:
-    """
-    Загружает ByteDance/CloudTimeSeriesData (FaaS) с HuggingFace.
-
-    Формат: date | data | cols (instance_N)
-    Шаг: 10 минут, период: 2022-04-02 — 2024-10-24, 1113 инстансов.
-
-    Суммирует нагрузку по всем (или top_n_instances) инстансам за каждый
-    момент времени → суммарная нагрузка FaaS-платформы.
-
-    Parameters
-    ----------
-    top_n_instances : если задан — берёт только N самых нагруженных инстансов
-    """
-    from datasets import load_dataset
-
-    print("Загрузка ByteDance/CloudTimeSeriesData (FaaS)...")
-    ds = load_dataset("ByteDance/CloudTimeSeriesData", split="train")
-    df = ds.to_pandas()
-
-    if top_n_instances is not None:
-        top = (
-            df.groupby("cols")["data"]
-            .sum()
-            .nlargest(top_n_instances)
-            .index
-        )
-        df = df[df["cols"].isin(top)]
-
-    df["date"] = pd.to_datetime(df["date"])
-    df_agg = (
-        df.groupby("date")["data"]
-        .sum()
-        .reset_index()
-        .rename(columns={"date": "ds", "data": "y"})
-        .sort_values("ds")
-        .reset_index(drop=True)
-    )
-    df_agg["y"] = df_agg["y"].clip(lower=0).fillna(0.0)
-
-    print(f"  FaaS: {len(df_agg)} точек | шаг 10 мин | "
-          f"y: min={df_agg['y'].min():.0f}, max={df_agg['y'].max():.0f}, "
-          f"mean={df_agg['y'].mean():.0f}")
-    print(f"  Период: {df_agg['ds'].iloc[0]} -> {df_agg['ds'].iloc[-1]}")
-    return df_agg
 
 
 if __name__ == "__main__":
