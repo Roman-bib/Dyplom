@@ -319,8 +319,8 @@ def train_prophet(
     exog_cols = [c for c in (exog_cols or [])
                  if c in train_df.columns and c in val_df.columns]
     keep = ["ds", "y"] + exog_cols
-    train_df = train_df[keep].copy()
-    val_df   = val_df[keep].copy()
+    train_df = train_df[keep].copy().reset_index(drop=True)
+    val_df   = val_df[keep].copy().reset_index(drop=True)
     train_df["ds"] = pd.to_datetime(train_df["ds"])
     val_df["ds"]   = pd.to_datetime(val_df["ds"])
 
@@ -393,7 +393,7 @@ def refit_prophet_full(
     exog_cols = [c for c in (exog_cols or getattr(base_model, "_exog_cols", []))
                  if c in train_val_df.columns]
     keep = ["ds", "y"] + exog_cols
-    train_val_df = train_val_df[keep].copy()
+    train_val_df = train_val_df[keep].copy().reset_index(drop=True)
     train_val_df["ds"] = pd.to_datetime(train_val_df["ds"])
 
     freq   = _infer_freq(train_val_df["ds"])
