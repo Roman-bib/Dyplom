@@ -454,14 +454,24 @@ def mode_csv(args) -> None:
     print("\nВажность признаков (XGBoost gain):")
     print(imp_df.to_string(index=False))
 
-    # --- График ---
-    save_path = None
-    if args.save_plots:
-        save_path = os.path.join(config.MODEL_SAVE_DIR, "forecast_csv.png")
+    # --- Графики ---
+    xgb_plot_path = os.path.join(config.MODEL_SAVE_DIR, "forecast_csv.png") if args.save_plots else None
     plot_forecast(
         train, val, test, preds, "XGBoost (web_traffic.csv)",
         lower=lower, upper=upper,
-        save_path=save_path,
+        save_path=xgb_plot_path,
+    )
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models.png"),
+        zoom=False,
+    )
+    plot_all_forecasts(
+        train, val, test,
+        predictions_dict=comparator.predictions_,
+        save_path=os.path.join(config.MODEL_SAVE_DIR, "comparison_all_models_zoom.png"),
+        zoom=True,
     )
 
     # --- Детекция пиков ---
