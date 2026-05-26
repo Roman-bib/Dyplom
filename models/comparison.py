@@ -315,7 +315,7 @@ class ModelComparison:
             # После grid-search дообучаем на train+val для финального предсказания
             final_model = refit_prophet_full(
                 base_model=best_model,
-                train_val_df=pd.concat([train, val]).sort_values("ds"),
+                train_val_df=pd.concat([train, val]).sort_values("ds").reset_index(drop=True),
                 use_holidays=_use_holidays,
                 country_code=_country,
                 exog_cols=_exog,
