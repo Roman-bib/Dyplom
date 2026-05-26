@@ -1,0 +1,30 @@
+# Основные зависимости
+numpy
+pandas
+scipy
+statsmodels
+joblib
+
+# Машинное обучение
+scikit-learn
+xgboost
+neuralprophet
+pmdarima
+
+# 
+tensorflow
+
+# Визуализация
+matplotlib
+seaborn
+plotly
+
+# Веб-приложение (app.py)
+streamlit
+
+# Данные и генерация
+holidays
+sdv
+
+# RobustSTL
+cvxopt
