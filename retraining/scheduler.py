@@ -20,9 +20,10 @@ import csv
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 import joblib
 import numpy as np
@@ -103,9 +104,9 @@ class RetrainScheduler:
         self.rollback_window = int(rollback_window)
         self.rollback_threshold = float(rollback_threshold)
 
-        # Скользящий буфер «(ds, y)» — копится во времени
-        self._history: pd.DataFrame = pd.DataFrame(columns=["ds", "y"])
+        # Скользящий буфер — deque даёт O(1) append/trim без pd.concat
         self._history_buffer_size = int(history_buffer_size)
+        self._history_deque: Deque[Dict] = deque(maxlen=self._history_buffer_size)
         self._last_retrain_ts: float = 0.0
         self.events: List[RetrainEvent] = []
 
@@ -120,10 +121,16 @@ class RetrainScheduler:
     # Публичный API
     # ------------------------------------------------------------------
 
+    @property
+    def _history(self) -> pd.DataFrame:
+        """DataFrame из внутреннего deque (только для совместимости с retrain)."""
+        return pd.DataFrame(list(self._history_deque))
+
     def seed_history(self, df: pd.DataFrame) -> None:
         """Заливает стартовую историю (например, train+val датасет)."""
-        df = df[["ds", "y"]].copy().sort_values("ds")
-        self._history = df.tail(self._history_buffer_size).reset_index(drop=True)
+        df = df[["ds", "y"]].copy().sort_values("ds").tail(self._history_buffer_size)
+        self._history_deque.clear()
+        self._history_deque.extend(df.to_dict("records"))
 
     def predict_one(self, current_df: pd.DataFrame) -> float:
         """
@@ -138,15 +145,8 @@ class RetrainScheduler:
         return float(np.asarray(pred).flatten()[0])
 
     def observe(self, ts: pd.Timestamp, y_true: float, y_pred: float) -> None:
-        """Добавляет наблюдение в буфер и обновляет drift detector."""
-        # Расширяем историю
-        new_row = pd.DataFrame([{"ds": pd.Timestamp(ts), "y": float(y_true)}])
-        self._history = (
-            pd.concat([self._history, new_row], ignore_index=True)
-            .drop_duplicates(subset="ds", keep="last")
-            .tail(self._history_buffer_size)
-            .reset_index(drop=True)
-        )
+        """Добавляет наблюдение в буфер O(1) и обновляет drift detector."""
+        self._history_deque.append({"ds": pd.Timestamp(ts), "y": float(y_true)})
         self.drift.observe(y_true=y_true, y_pred=y_pred)
 
     def check_and_retrain(self) -> Optional[RetrainEvent]:

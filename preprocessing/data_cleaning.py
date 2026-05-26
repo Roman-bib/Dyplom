@@ -233,30 +233,10 @@ class TimeSeriesCleaner:
         tukey_up = q3 + self.tukey_k * (q3 - q1)
         is_positive_outlier = residual > tukey_up
 
-        # DBSCAN: положительные выбросы которые кластеризуются во времени →
-        # нерегулярный повторяющийся паттерн (рассылка пн→ср→пт и т.п.) →
-        # сохранить. Одиночный изолированный выброс → шум → убрать.
-        recurring_mask = np.zeros(len(residual), dtype=bool)
-        outlier_pos = np.where(is_positive_outlier & ~event_mask)[0]
-        if len(outlier_pos) >= 2:
-            try:
-                from sklearn.cluster import DBSCAN
-                # eps = 3 дня в точках; min_samples=2 — нужно минимум 2 выброса рядом
-                eps_points = 3 * 24 * 3600 // max(self.step_seconds_, 1)
-                labels = DBSCAN(
-                    eps=eps_points, min_samples=2
-                ).fit(outlier_pos.reshape(-1, 1)).labels_
-                clustered = outlier_pos[labels != -1]   # -1 = isolated noise
-                recurring_mask[clustered] = True
-            except ImportError:
-                pass
-        event_mask = event_mask | recurring_mask
-
         # Классификация:
-        #   провал (вниз)                    → всегда шум (сбой инфраструктуры)
-        #   рост на обычном дне, изолирован  → шум
-        #   рост в праздник/кампанию         → легитимный пик, сохранить
-        #   рост нерегулярный но повторный   → легитимный паттерн, сохранить
+        #   провал (вниз)            → шум (сбой инфраструктуры)
+        #   рост на обычном дне      → шум
+        #   рост в праздник/кампанию → легитимный пик, сохранить
         noise_mask      = is_negative_outlier | (is_positive_outlier & ~event_mask)
         legitimate_peak = is_positive_outlier & event_mask
 

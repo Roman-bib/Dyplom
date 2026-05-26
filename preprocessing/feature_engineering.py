@@ -198,15 +198,15 @@ class FeatureBuilder:
                 is_spike_prev.rolling(n_24, min_periods=1).sum().fillna(0)
             )
 
-            spike_idx = is_spike_prev.values.astype(int)
-            time_since = np.zeros(len(spike_idx), dtype=float)
-            counter = float(n_24)
-            for i in range(len(spike_idx)):
-                if spike_idx[i] == 1:
-                    counter = 0.0
-                else:
-                    counter += 1.0
-                time_since[i] = counter
+            spike_arr = is_spike_prev.values.astype(bool)
+            idx = np.arange(len(spike_arr))
+            spike_pos = np.where(spike_arr)[0]
+            if len(spike_pos):
+                last_spike = np.searchsorted(spike_pos, idx, side="right") - 1
+                has_prev = last_spike >= 0
+                time_since = np.where(has_prev, idx - spike_pos[np.maximum(last_spike, 0)], idx + float(n_24))
+            else:
+                time_since = idx + float(n_24)
             data["y_periods_since_spike"] = time_since / max(n_24, 1)
 
             feature_names += [

@@ -77,22 +77,29 @@ def run_walk_forward(
     retrain_timestamps = []
     retrain_intervals = []
     last_retrain_i = 0
-    history = history_seed.reset_index(drop=True)
+
+    # Список вместо растущего DataFrame: O(1) append, без pd.concat на каждом шаге.
+    # Для построения признаков берём только последние _FEAT_WINDOW точек —
+    # достаточно для самого длинного лага (168 ч = 10080 мин).
+    _FEAT_WINDOW = 12000
+    history_records: list = history_seed.reset_index(drop=True).to_dict("records")
+
+    def _history_df() -> pd.DataFrame:
+        return pd.DataFrame(history_records[-_FEAT_WINDOW:])
 
     for i, row in test.reset_index(drop=True).iterrows():
         current_ts = pd.Timestamp(row["ds"])
         y_true = float(row["y"])
 
-        y_pred = scheduler.predict_one(history)
-        X_last = builder.get_X(history)
+        hist_df = _history_df()
+        y_pred = scheduler.predict_one(hist_df)
+        X_last = builder.get_X(hist_df)
         y_pred_baseline = float(
             np.asarray(predict_fn(initial_model, X_last)).flatten()[0]
         ) if len(X_last) > 0 else float("nan")
 
         if np.isnan(y_pred):
-            history = pd.concat(
-                [history, pd.DataFrame([row])], ignore_index=True
-            )
+            history_records.append({"ds": current_ts, "y": y_true})
             continue
 
         mae_step = abs(y_true - y_pred)
@@ -105,18 +112,15 @@ def run_walk_forward(
             retrain_intervals.append(i - last_retrain_i)
             last_retrain_i = i
 
-            # Обновляем сезонную составляющую cleaner-а если накоплено
-            # не менее 2 полных сезонных циклов в истории.
-            # Вызывается только при реальном дрейфе — не при каждом шаге,
-            # чтобы избежать утечки будущих данных в параметры предобработки.
             if cleaner is not None and hasattr(cleaner, "seasonal_") \
                     and cleaner.seasonal_ is not None:
                 season_len = len(cleaner.seasonal_)
-                if len(history) >= 2 * season_len:
-                    cleaner.fit(history.tail(max(2 * season_len, len(history))))
+                n_hist = len(history_records)
+                if n_hist >= 2 * season_len:
+                    cleaner.fit(pd.DataFrame(history_records[-max(2 * season_len, n_hist):]))
                     if verbose:
                         print(f"  [cleaner.fit] сезонная составляющая обновлена "
-                              f"(history={len(history)}, season_len={season_len})")
+                              f"(history={n_hist}, season_len={season_len})")
 
             if verbose:
                 print(f"  [retrain] шаг {i}: MAE {event.rolling_mae_before:.2f} → "
@@ -138,10 +142,7 @@ def run_walk_forward(
             "mae_baseline": mae_baseline,
         })
 
-        history = pd.concat(
-            [history, pd.DataFrame([{"ds": current_ts, "y": y_true}])],
-            ignore_index=True,
-        )
+        history_records.append({"ds": current_ts, "y": y_true})
 
         if verbose and i % 50 == 0:
             print(f"  шаг {i}/{len(test)}, MAE адапт.={mae_step:.2f}, "
