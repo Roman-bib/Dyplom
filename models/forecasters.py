@@ -494,10 +494,17 @@ def predict_prophet(
     if freq is None:
         freq = _infer_freq(train_df["ds"])
 
+    # AR-модели (n_lags > 0) требуют контекста из актуальных значений y.
+    # n_historic_predictions=n_lags включает последние n_lags строк истории
+    # в датафрейм предсказания → модель получает AR-контекст для шага 1,
+    # затем предсказывает аутрегрессивно. Без этого возвращается ~n_forecasts строк.
+    n_lags = getattr(model, "n_lags", 0)
+    n_hist = int(n_lags) if n_lags and n_lags > 0 else False
+
     future = model.make_future_dataframe(
         df=train_df,
         periods=periods,
-        n_historic_predictions=False,
+        n_historic_predictions=n_hist,
     )
 
     exog_cols = getattr(model, "_exog_cols", [])
