@@ -60,9 +60,10 @@ def load_csv(
     value_col: Optional[str] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    extra_cols: Optional[list] = None,
 ) -> pd.DataFrame:
     """
-    Загружает CSV и возвращает DataFrame {ds, y}.
+    Загружает CSV и возвращает DataFrame {ds, y[, extra_cols...]}.
 
     Parameters
     ----------
@@ -70,10 +71,12 @@ def load_csv(
     timestamp_col : колонка с датой/временем (None = автоопределение)
     value_col     : целевая метрика (None = первая числовая колонка)
     start, end    : фильтр по дате ("2023-06-01" и т.д.)
+    extra_cols    : дополнительные колонки для сохранения (например,
+                    ["is_holiday", "is_campaign", "is_promo"])
 
     Returns
     -------
-    DataFrame с колонками ds (datetime) и y (float), отсортированный по ds.
+    DataFrame с колонками ds (datetime), y (float) и extra_cols (если заданы).
     """
     csv_path = Path(path) if path else DEFAULT_CSV_PATH
 
@@ -102,7 +105,10 @@ def load_csv(
 
     df[ts_col] = pd.to_datetime(df[ts_col])
     df = df.rename(columns={ts_col: "ds", val_col: "y"})
-    df = df[["ds", "y"]].sort_values("ds").reset_index(drop=True)
+    keep = ["ds", "y"]
+    if extra_cols:
+        keep += [c for c in extra_cols if c in df.columns]
+    df = df[keep].sort_values("ds").reset_index(drop=True)
 
     if start:
         df = df[df["ds"] >= pd.to_datetime(start)]
