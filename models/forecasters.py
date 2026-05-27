@@ -18,7 +18,6 @@ import joblib
 import numpy as np
 import pandas as pd
 
-
 # ===========================================================================
 # XGBoost
 # ===========================================================================
@@ -463,10 +462,11 @@ def predict_prophet(
     if freq is None:
         freq = _infer_freq(train_df["ds"])
 
+    n_lags = getattr(model, "n_lags", 0) or 0
     future = model.make_future_dataframe(
         df=train_df,
         periods=periods,
-        n_historic_predictions=False,
+        n_historic_predictions=n_lags if n_lags > 0 else False,
     )
 
     exog_cols = getattr(model, "_exog_cols", [])
