@@ -309,7 +309,12 @@ class ModelComparison:
             # (интерполяция — шаг пайплайна, общий для всех моделей)
             def _fill_y(df):
                 d = df[["ds", "y"] + [c for c in df.columns if c not in ("ds","y")]].copy()
-                d["y"] = d["y"].interpolate(method="time").bfill().ffill()
+                # method="linear" не требует DatetimeIndex (в отличие от "time")
+                d["y"] = d["y"].interpolate(method="linear").bfill().ffill()
+                # бинарные экзогенные флаги заполняем 0 (нет события = нет флага)
+                for col in d.columns:
+                    if col not in ("ds", "y") and d[col].isna().any():
+                        d[col] = d[col].fillna(0)
                 return d.reset_index(drop=True)
 
             best_model = train_prophet(
@@ -347,9 +352,14 @@ class ModelComparison:
             save_prophet(final_model, save_path)
 
             elapsed = time.time() - t0
+            # y_train_for_mase должен быть без NaN — берём заполненные версии,
+            # иначе sklearn-метрики (MASE) падают с "Input contains NaN"
+            _tv_filled = pd.concat(
+                [_fill_y(train), _fill_y(val)]
+            ).sort_values("ds").reset_index(drop=True)
             self._record("Prophet", y_test, preds, peak_threshold, elapsed,
                          model_obj=final_model,
-                         y_train_for_mase=pd.concat([train, val])["y"].values)
+                         y_train_for_mase=_tv_filled["y"].values)
         except Exception as e:
             print(f"  Prophet пропущен: {e}")
 

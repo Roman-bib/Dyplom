@@ -329,6 +329,12 @@ def train_prophet(
     val_df   = val_df[keep].copy().reset_index(drop=True)
     train_df["ds"] = pd.to_datetime(train_df["ds"])
     val_df["ds"]   = pd.to_datetime(val_df["ds"])
+    # Защита: NeuralProphet не принимает NaN в y или экзогенных колонках
+    train_df["y"] = train_df["y"].interpolate(method="linear").bfill().ffill()
+    val_df["y"]   = val_df["y"].interpolate(method="linear").bfill().ffill()
+    for col in exog_cols:
+        train_df[col] = train_df[col].fillna(0)
+        val_df[col]   = val_df[col].fillna(0)
 
     freq   = _infer_freq(train_df["ds"])
     yearly = _enough_for_yearly(train_df["ds"])
@@ -430,6 +436,10 @@ def refit_prophet_full(
     keep = ["ds", "y"] + exog_cols
     train_val_df = train_val_df[keep].copy().reset_index(drop=True)
     train_val_df["ds"] = pd.to_datetime(train_val_df["ds"])
+    # Защита: NeuralProphet не принимает NaN
+    train_val_df["y"] = train_val_df["y"].interpolate(method="linear").bfill().ffill()
+    for col in exog_cols:
+        train_val_df[col] = train_val_df[col].fillna(0)
 
     freq   = _infer_freq(train_val_df["ds"])
     yearly = _enough_for_yearly(train_val_df["ds"])
