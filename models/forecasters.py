@@ -416,6 +416,10 @@ def refit_prophet_full(
     exog_cols: Optional[List[str]] = None,
 ):
     """Переобучает NeuralProphet с теми же гиперпараметрами на train+val."""
+    import torch as _torch
+    _orig_load = _torch.load
+    _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
+
     exog_cols = [c for c in (exog_cols or getattr(base_model, "_exog_cols", []))
                  if c in train_val_df.columns]
     keep = ["ds", "y"] + exog_cols
@@ -441,6 +445,7 @@ def refit_prophet_full(
         m.add_future_regressor(col)
 
     m.fit(train_val_df, freq=freq)
+    _torch.load = _orig_load  # восстанавливаем после fit
     m._train_df    = train_val_df
     m._best_params = params
     m._exog_cols   = exog_cols
