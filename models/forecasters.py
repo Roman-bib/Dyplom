@@ -494,45 +494,70 @@ def predict_prophet(
     if freq is None:
         freq = _infer_freq(train_df["ds"])
 
-    # AR-модели (n_lags > 0) требуют контекста из актуальных значений y.
-    # n_historic_predictions=n_lags включает последние n_lags строк истории
-    # в датафрейм предсказания → модель получает AR-контекст для шага 1,
-    # затем предсказывает аутрегрессивно. Без этого возвращается ~n_forecasts строк.
-    n_lags = getattr(model, "n_lags", 0)
-    n_hist = int(n_lags) if n_lags and n_lags > 0 else False
-
-    future = model.make_future_dataframe(
-        df=train_df,
-        periods=periods,
-        n_historic_predictions=n_hist,
-    )
-
     exog_cols = getattr(model, "_exog_cols", [])
-    if exog_cols and future_regressors is not None:
-        future["ds"] = pd.to_datetime(future["ds"])
-        fr = future_regressors.copy()
-        fr["ds"] = pd.to_datetime(fr["ds"])
-        for col in exog_cols:
-            if col in fr.columns:
-                future = future.merge(fr[["ds", col]], on="ds", how="left")
-                future[col] = future[col].fillna(0).astype(int)
+    n_lags = getattr(model, "n_lags", 0)
 
-    forecast = model.predict(future)
+    if n_lags and n_lags > 0:
+        # NeuralProphet с n_forecasts=1 принудительно ставит periods=1,
+        # поэтому multi-step прогноз делается итеративно: каждый шаг
+        # добавляет своё предсказание обратно в историю как "known y".
+        history = train_df[["ds", "y"]].copy()
+        rows: list = []
+        for step in range(periods):
+            fut = model.make_future_dataframe(
+                df=history,
+                periods=model.n_forecasts,
+                n_historic_predictions=False,
+            )
+            if exog_cols and future_regressors is not None:
+                fut["ds"] = pd.to_datetime(fut["ds"])
+                fr = future_regressors.copy()
+                fr["ds"] = pd.to_datetime(fr["ds"])
+                for col in exog_cols:
+                    if col in fr.columns:
+                        fut = fut.merge(fr[["ds", col]], on="ds", how="left")
+                        fut[col] = fut[col].fillna(0).astype(int)
+            fc = model.predict(fut)
+            if fc.empty or "yhat1" not in fc.columns:
+                break
+            last = fc.iloc[-1]
+            new_yhat = float(last["yhat1"]) if not pd.isna(last["yhat1"]) else 0.0
+            lc = next((c for c in fc.columns if "10.0%" in c), None)
+            uc = next((c for c in fc.columns if "90.0%" in c), None)
+            rows.append({
+                "ds":         last["ds"],
+                "yhat":       new_yhat,
+                "yhat_lower": float(last[lc]) if lc and not pd.isna(last[lc]) else new_yhat,
+                "yhat_upper": float(last[uc]) if uc and not pd.isna(last[uc]) else new_yhat,
+            })
+            new_row = pd.DataFrame({"ds": [last["ds"]], "y": [new_yhat]})
+            history = pd.concat([history, new_row]).reset_index(drop=True)
+        out = pd.DataFrame(rows).reset_index(drop=True)
+    else:
+        future = model.make_future_dataframe(
+            df=train_df,
+            periods=periods,
+            n_historic_predictions=False,
+        )
+        if exog_cols and future_regressors is not None:
+            future["ds"] = pd.to_datetime(future["ds"])
+            fr = future_regressors.copy()
+            fr["ds"] = pd.to_datetime(fr["ds"])
+            for col in exog_cols:
+                if col in fr.columns:
+                    future = future.merge(fr[["ds", col]], on="ds", how="left")
+                    future[col] = future[col].fillna(0).astype(int)
+        forecast = model.predict(future)
+        out = forecast[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"}).copy()
+        lower_col = next((c for c in forecast.columns if "10.0%" in c), None)
+        upper_col = next((c for c in forecast.columns if "90.0%" in c), None)
+        out["yhat_lower"] = forecast[lower_col].values if lower_col else out["yhat"]
+        out["yhat_upper"] = forecast[upper_col].values if upper_col else out["yhat"]
+        out = out.iloc[-periods:].reset_index(drop=True)
 
-    out = forecast[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"}).copy()
-
-    lower_col = next((c for c in forecast.columns if "10.0%" in c), None)
-    upper_col = next((c for c in forecast.columns if "90.0%" in c), None)
-    out["yhat_lower"] = forecast[lower_col].values if lower_col else out["yhat"]
-    out["yhat_upper"] = forecast[upper_col].values if upper_col else out["yhat"]
-
-    out = out.iloc[-periods:].reset_index(drop=True)
-
-    # AR-модели (n_lags > 0) могут давать NaN в первых шагах из-за прогрева.
-    # Заполняем медианой, чтобы не падал mean_absolute_error ниже по стеку.
     for col in ("yhat", "yhat_lower", "yhat_upper"):
         if out[col].isna().any():
-            fill_val = out[col].median()
+            fill_val = float(out[col].median())
             if np.isnan(fill_val):
                 fill_val = 0.0
             out[col] = out[col].fillna(fill_val)
