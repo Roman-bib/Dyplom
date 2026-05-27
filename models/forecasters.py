@@ -520,6 +520,37 @@ def predict_prophet(
         or 0
     )
 
+    # Строим единый lookup: train-период из _train_df + test-период из future_regressors.
+    # Используем map() вместо merge(), чтобы избежать дублирования колонок (col_x/col_y).
+    _exog_lookup: Dict[str, pd.Series] = {}
+    if exog_cols:
+        for col in exog_cols:
+            if col in train_df.columns:
+                _exog_lookup[col] = train_df.set_index(
+                    pd.to_datetime(train_df["ds"])
+                )[col]
+        if future_regressors is not None:
+            _fr = future_regressors.copy()
+            _fr["ds"] = pd.to_datetime(_fr["ds"])
+            for col in exog_cols:
+                if col in _fr.columns:
+                    s = _fr.set_index("ds")[col]
+                    _exog_lookup[col] = (
+                        pd.concat([_exog_lookup[col], s])
+                        if col in _exog_lookup else s
+                    )
+
+    def _attach_exog(df: pd.DataFrame) -> pd.DataFrame:
+        """Добавляет/перезаписывает колонки экзогенных признаков по ds."""
+        if not exog_cols:
+            return df
+        df = df.copy()
+        df["ds"] = pd.to_datetime(df["ds"])
+        for col in exog_cols:
+            lookup = _exog_lookup.get(col, pd.Series(dtype=float))
+            df[col] = df["ds"].map(lookup).fillna(0).astype(int)
+        return df
+
     if n_lags and n_lags > 0:
         # NeuralProphet с n_forecasts=1 принудительно ставит periods=1,
         # поэтому multi-step прогноз делается итеративно: каждый шаг
@@ -534,14 +565,7 @@ def predict_prophet(
                 periods=model.n_forecasts,
                 n_historic_predictions=int(n_lags),
             )
-            if exog_cols and future_regressors is not None:
-                fut["ds"] = pd.to_datetime(fut["ds"])
-                fr = future_regressors.copy()
-                fr["ds"] = pd.to_datetime(fr["ds"])
-                for col in exog_cols:
-                    if col in fr.columns:
-                        fut = fut.merge(fr[["ds", col]], on="ds", how="left")
-                        fut[col] = fut[col].fillna(0).astype(int)
+            fut = _attach_exog(fut)
             fc = model.predict(fut)
             if fc.empty or "yhat1" not in fc.columns:
                 break
@@ -564,14 +588,7 @@ def predict_prophet(
             periods=periods,
             n_historic_predictions=False,
         )
-        if exog_cols and future_regressors is not None:
-            future["ds"] = pd.to_datetime(future["ds"])
-            fr = future_regressors.copy()
-            fr["ds"] = pd.to_datetime(fr["ds"])
-            for col in exog_cols:
-                if col in fr.columns:
-                    future = future.merge(fr[["ds", col]], on="ds", how="left")
-                    future[col] = future[col].fillna(0).astype(int)
+        future = _attach_exog(future)
         forecast = model.predict(future)
         out = forecast[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"}).copy()
         lower_col = next((c for c in forecast.columns if "10.0%" in c), None)
