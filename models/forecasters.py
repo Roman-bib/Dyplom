@@ -595,10 +595,11 @@ def predict_prophet(
             history = pd.concat([history, new_row]).reset_index(drop=True)
         out = pd.DataFrame(rows).reset_index(drop=True)
     else:
+        _n_lags = getattr(model, "n_lags", 0) or 0
         future = model.make_future_dataframe(
             df=train_df,
             periods=periods,
-            n_historic_predictions=False,
+            n_historic_predictions=int(_n_lags) if _n_lags > 0 else False,
         )
         future = _attach_exog(future)
         forecast = model.predict(future)
