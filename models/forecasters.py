@@ -281,11 +281,12 @@ def _build_neuralprophet(params: dict, yearly: bool):
         n_changepoints=params["n_changepoints"],
         trend_reg=params["trend_reg"],
         seasonality_reg=params["seasonality_reg"],
+        ar_reg=params.get("ar_reg", 0.1),
         daily_seasonality=True,
         weekly_seasonality=True,
         yearly_seasonality=yearly,
         n_forecasts=1,
-        n_lags=0,
+        n_lags=params.get("n_lags", 0),
         quantiles=[0.1, 0.9],
     )
 
@@ -327,10 +328,25 @@ def train_prophet(
     freq   = _infer_freq(train_df["ds"])
     yearly = _enough_for_yearly(train_df["ds"])
 
+    # n_lags зависит от частоты: для часовых данных = 24 (1 сутки),
+    # для суб-часовых используем 1 час назад в периодах, но не больше 48.
+    _step_sec = float(
+        pd.Series(train_df["ds"]).diff().dropna().dt.total_seconds().median()
+    )
+    _step_min = _step_sec / 60
+    if _step_min >= 30:          # hourly или реже
+        _ar_lags = 24
+    elif _step_min >= 5:         # 5–30 min
+        _ar_lags = max(12, int(round(60 / _step_min)))   # ~1 час
+    else:
+        _ar_lags = 12
+
     param_grid = {
         "n_changepoints":  [10, 30],
         "trend_reg":       [0.1, 1.0],
         "seasonality_reg": [0.1, 1.0],
+        "n_lags":          [0, _ar_lags],   # 0 = чистый Prophet; >0 = AR-Net
+        "ar_reg":          [0.1],
     }
     all_params = [dict(zip(param_grid.keys(), v))
                   for v in product(*param_grid.values())]
