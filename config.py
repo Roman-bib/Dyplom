@@ -69,6 +69,10 @@ SCALE_DOWN_BACKOFF = 300            # задержка уменьшения ре
 # --- Порог переобучения (глава 2.6.4 ВКР) ---
 MAPE_RETRAIN_THRESHOLD = 20.0       # при MAPE > 20% инициировать переобучение
 
+# --- Экзогенные признаки (известны заранее: праздники, акции, кампании) ---
+# Используются в NeuralProphet как future_regressor, в XGBoost/LSTM как обычные признаки.
+EXOG_COLS = ["is_holiday", "is_campaign", "is_promo"]
+
 # --- Синтетические данные (для демо без Prometheus) ---
 SYNTHETIC_DAYS = 30
 SYNTHETIC_FREQ = "5min"             # шаг синтетики = шагу реального сбора

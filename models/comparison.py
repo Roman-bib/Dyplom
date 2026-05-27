@@ -278,12 +278,14 @@ class ModelComparison:
         preds = predict_xgboost(model, X_test)
         elapsed = time.time() - t0
 
-        mae_train = float(np.mean(np.abs(y_train.values - predict_xgboost(model, X_train))))
-        mae_val   = float(np.mean(np.abs(y_val.values   - predict_xgboost(model, X_val))))
+        y_tr_arr = np.asarray(y_train, dtype=float).flatten()
+        y_vl_arr = np.asarray(y_val,   dtype=float).flatten()
+        mae_train = float(np.mean(np.abs(y_tr_arr - predict_xgboost(model, X_train))))
+        mae_val   = float(np.mean(np.abs(y_vl_arr - predict_xgboost(model, X_val))))
 
         self._record("XGBoost", y_test, preds, peak_threshold, elapsed,
                      model_obj=model,
-                     y_train_for_mase=pd.concat([y_train, y_val]).values,
+                     y_train_for_mase=np.concatenate([y_tr_arr, y_vl_arr]),
                      mae_train=mae_train, mae_val=mae_val)
 
     def _fit_prophet(self, train, val, test, y_test, peak_threshold):
@@ -303,9 +305,21 @@ class ModelComparison:
             _exog = [c for c in getattr(_cfg, "EXOG_COLS", [])
                      if c in train.columns]
 
+            # NeuralProphet получает ds+y без RobustSTL, но с заполнением пропусков
+            # (интерполяция — шаг пайплайна, общий для всех моделей)
+            def _fill_y(df):
+                d = df[["ds", "y"] + [c for c in df.columns if c not in ("ds","y")]].copy()
+                # method="linear" не требует DatetimeIndex (в отличие от "time")
+                d["y"] = d["y"].interpolate(method="linear").bfill().ffill()
+                # бинарные экзогенные флаги заполняем 0 (нет события = нет флага)
+                for col in d.columns:
+                    if col not in ("ds", "y") and d[col].isna().any():
+                        d[col] = d[col].fillna(0)
+                return d.reset_index(drop=True)
+
             best_model = train_prophet(
-                train_df=train,
-                val_df=val,
+                train_df=_fill_y(train),
+                val_df=_fill_y(val),
                 save_path=None,        # сохраним позже после refit
                 use_holidays=_use_holidays,
                 country_code=_country,
@@ -315,7 +329,7 @@ class ModelComparison:
             # После grid-search дообучаем на train+val для финального предсказания
             final_model = refit_prophet_full(
                 base_model=best_model,
-                train_val_df=pd.concat([train, val]).sort_values("ds").reset_index(drop=True),
+                train_val_df=_fill_y(pd.concat([train, val]).sort_values("ds").reset_index(drop=True)),
                 use_holidays=_use_holidays,
                 country_code=_country,
                 exog_cols=_exog,
@@ -338,9 +352,14 @@ class ModelComparison:
             save_prophet(final_model, save_path)
 
             elapsed = time.time() - t0
+            # y_train_for_mase должен быть без NaN — берём заполненные версии,
+            # иначе sklearn-метрики (MASE) падают с "Input contains NaN"
+            _tv_filled = pd.concat(
+                [_fill_y(train), _fill_y(val)]
+            ).sort_values("ds").reset_index(drop=True)
             self._record("Prophet", y_test, preds, peak_threshold, elapsed,
                          model_obj=final_model,
-                         y_train_for_mase=pd.concat([train, val])["y"].values)
+                         y_train_for_mase=_tv_filled["y"].values)
         except Exception as e:
             print(f"  Prophet пропущен: {e}")
 
@@ -384,7 +403,10 @@ class ModelComparison:
 
             self._record("LSTM", y_test, preds, peak_threshold, elapsed,
                          model_obj=artifact,
-                         y_train_for_mase=pd.concat([y_train, y_val]).values,
+                         y_train_for_mase=np.concatenate([
+                             np.asarray(y_train, dtype=float).flatten(),
+                             np.asarray(y_val,   dtype=float).flatten(),
+                         ]),
                          mae_train=mae_train_lstm, mae_val=mae_val_lstm)
         except ImportError as e:
             print(f"  LSTM пропущен (нет TensorFlow): {e}")

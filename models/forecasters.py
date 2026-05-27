@@ -18,6 +18,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
+# NumPy 2.0 удалил np.NaN; NeuralProphet всё ещё использует его внутри.
+# Патч должен быть применён ДО импорта neuralprophet.
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan  # type: ignore[attr-defined]
+
+
 # ===========================================================================
 # XGBoost
 # ===========================================================================
@@ -280,11 +286,12 @@ def _build_neuralprophet(params: dict, yearly: bool):
         n_changepoints=params["n_changepoints"],
         trend_reg=params["trend_reg"],
         seasonality_reg=params["seasonality_reg"],
+        ar_reg=params.get("ar_reg", 0.1),
         daily_seasonality=True,
         weekly_seasonality=True,
         yearly_seasonality=yearly,
         n_forecasts=1,
-        n_lags=0,
+        n_lags=params.get("n_lags", 0),
         quantiles=[0.1, 0.9],
     )
 
@@ -322,14 +329,40 @@ def train_prophet(
     val_df   = val_df[keep].copy().reset_index(drop=True)
     train_df["ds"] = pd.to_datetime(train_df["ds"])
     val_df["ds"]   = pd.to_datetime(val_df["ds"])
+    # Защита: NeuralProphet не принимает NaN в y или экзогенных колонках
+    train_df["y"] = train_df["y"].interpolate(method="linear").bfill().ffill()
+    val_df["y"]   = val_df["y"].interpolate(method="linear").bfill().ffill()
+    for col in exog_cols:
+        train_df[col] = train_df[col].fillna(0)
+        val_df[col]   = val_df[col].fillna(0)
+    # Колонки с нулевой дисперсией в train ломают NeuralProphet: StandardScaler
+    # внутри NP вычисляет (x - mean) / std, и при std=0 получает NaN для будущих
+    # строк (y=NaN), что вызывает "Future values of all user specified regressors
+    # not provided" — даже если мы явно заполнили колонку нулями через _attach_exog.
+    exog_cols = [c for c in exog_cols if train_df[c].nunique() > 1]
 
     freq   = _infer_freq(train_df["ds"])
     yearly = _enough_for_yearly(train_df["ds"])
+
+    # n_lags зависит от частоты: для часовых данных = 24 (1 сутки),
+    # для суб-часовых используем 1 час назад в периодах, но не больше 48.
+    _step_sec = float(
+        pd.Series(train_df["ds"]).diff().dropna().dt.total_seconds().median()
+    )
+    _step_min = _step_sec / 60
+    if _step_min >= 30:          # hourly или реже
+        _ar_lags = 24
+    elif _step_min >= 5:         # 5–30 min
+        _ar_lags = max(12, int(round(60 / _step_min)))   # ~1 час
+    else:
+        _ar_lags = 12
 
     param_grid = {
         "n_changepoints":  [10, 30],
         "trend_reg":       [0.1, 1.0],
         "seasonality_reg": [0.1, 1.0],
+        "n_lags":          [0, _ar_lags],   # 0 = чистый Prophet; >0 = AR-Net
+        "ar_reg":          [0.1],
     }
     all_params = [dict(zip(param_grid.keys(), v))
                   for v in product(*param_grid.values())]
@@ -354,11 +387,21 @@ def train_prophet(
             m.add_future_regressor(col)
         m.fit(train_df, freq=freq)
 
-        forecast = m.predict(val_df)
-        mae = mean_absolute_error(
-            val_df["y"].values[-len(forecast):],
-            forecast["yhat1"].values,
-        )
+        # AR-модели (n_lags > 0) нуждаются в контексте train для предсказания val.
+        # Передаём train+val, берём только последние len(val_df) строк прогноза.
+        if params.get("n_lags", 0) > 0:
+            combined_pred = pd.concat([train_df, val_df]).reset_index(drop=True)
+            forecast_full = m.predict(combined_pred)
+            forecast = forecast_full.iloc[-len(val_df):].reset_index(drop=True)
+        else:
+            forecast = m.predict(val_df)
+
+        yhat  = forecast["yhat1"].values
+        ytrue = val_df["y"].values[-len(yhat):]
+        mask  = ~np.isnan(yhat)
+        if mask.sum() == 0:
+            continue   # комбинация без валидных предсказаний — пропускаем
+        mae = mean_absolute_error(ytrue[mask], yhat[mask])
 
         if mae < best_mae:
             best_mae   = mae
@@ -389,11 +432,21 @@ def refit_prophet_full(
     exog_cols: Optional[List[str]] = None,
 ):
     """Переобучает NeuralProphet с теми же гиперпараметрами на train+val."""
+    import torch as _torch
+    _orig_load = _torch.load
+    _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
+
     exog_cols = [c for c in (exog_cols or getattr(base_model, "_exog_cols", []))
                  if c in train_val_df.columns]
     keep = ["ds", "y"] + exog_cols
     train_val_df = train_val_df[keep].copy().reset_index(drop=True)
     train_val_df["ds"] = pd.to_datetime(train_val_df["ds"])
+    # Защита: NeuralProphet не принимает NaN
+    train_val_df["y"] = train_val_df["y"].interpolate(method="linear").bfill().ffill()
+    for col in exog_cols:
+        train_val_df[col] = train_val_df[col].fillna(0)
+    # Колонки с нулевой дисперсией ломают NP-нормализацию при прогнозе (std=0 → NaN)
+    exog_cols = [c for c in exog_cols if train_val_df[c].nunique() > 1]
 
     freq   = _infer_freq(train_val_df["ds"])
     yearly = _enough_for_yearly(train_val_df["ds"])
@@ -414,6 +467,7 @@ def refit_prophet_full(
         m.add_future_regressor(col)
 
     m.fit(train_val_df, freq=freq)
+    _torch.load = _orig_load  # восстанавливаем после fit
     m._train_df    = train_val_df
     m._best_params = params
     m._exog_cols   = exog_cols
@@ -462,56 +516,138 @@ def predict_prophet(
     if freq is None:
         freq = _infer_freq(train_df["ds"])
 
-    n_lags = getattr(model, "n_lags", 0) or 0
-    future = model.make_future_dataframe(
-        df=train_df,
-        periods=periods,
-        n_historic_predictions=n_lags if n_lags > 0 else False,
+    exog_cols = getattr(model, "_exog_cols", [])
+    # NeuralProphet хранит n_lags в config_ar.n_lags, а не как прямой атрибут.
+    # Используем _best_params (который мы сами пишем в refit_prophet_full).
+    _bp = getattr(model, "_best_params", {}) or {}
+    n_lags = int(
+        getattr(model, "n_lags", None)
+        or getattr(getattr(model, "config_ar", None), "n_lags", None)
+        or _bp.get("n_lags", 0)
+        or 0
     )
 
-    exog_cols = getattr(model, "_exog_cols", [])
-    if exog_cols and future_regressors is not None:
-        future["ds"] = pd.to_datetime(future["ds"])
-        fr = future_regressors.copy()
-        fr["ds"] = pd.to_datetime(fr["ds"])
+    # Строим единый lookup: train-период из _train_df + test-период из future_regressors.
+    # Используем map() вместо merge(), чтобы избежать дублирования колонок (col_x/col_y).
+    _exog_lookup: Dict[str, pd.Series] = {}
+    if exog_cols:
         for col in exog_cols:
-            if col in fr.columns:
-                future = future.merge(fr[["ds", col]], on="ds", how="left")
-                future[col] = future[col].fillna(0).astype(int)
+            if col in train_df.columns:
+                _exog_lookup[col] = train_df.set_index(
+                    pd.to_datetime(train_df["ds"])
+                )[col]
+        if future_regressors is not None:
+            _fr = future_regressors.copy()
+            _fr["ds"] = pd.to_datetime(_fr["ds"])
+            for col in exog_cols:
+                if col in _fr.columns:
+                    s = _fr.set_index("ds")[col]
+                    _exog_lookup[col] = (
+                        pd.concat([_exog_lookup[col], s])
+                        if col in _exog_lookup else s
+                    )
 
-    forecast = model.predict(future)
+    def _attach_exog(df: pd.DataFrame) -> pd.DataFrame:
+        """Добавляет/перезаписывает колонки экзогенных признаков по ds."""
+        if not exog_cols:
+            return df
+        df = df.copy()
+        df["ds"] = pd.to_datetime(df["ds"])
+        for col in exog_cols:
+            lookup = _exog_lookup.get(col, pd.Series(dtype=float))
+            df[col] = df["ds"].map(lookup).fillna(0).astype(int)
+        return df
 
-    out = forecast[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"}).copy()
+    if n_lags and n_lags > 0:
+        # NeuralProphet с n_forecasts=1 принудительно ставит periods=1,
+        # поэтому multi-step прогноз делается итеративно: каждый шаг
+        # добавляет своё предсказание обратно в историю как "known y".
+        # n_historic_predictions=n_lags даёт AR-контекст (последние n_lags строк),
+        # иначе модель предсказывает без авторегрессивной компоненты.
+        # История должна содержать экзогенные колонки — make_future_dataframe
+        # валидирует входной df на наличие зарегистрированных регрессоров ещё
+        # до того, как мы сами успеваем их добавить через _attach_exog.
+        history = _attach_exog(train_df[["ds", "y"]].copy())
+        rows: list = []
+        for step in range(periods):
+            fut = model.make_future_dataframe(
+                df=history,
+                periods=model.n_forecasts,
+                n_historic_predictions=int(n_lags),
+            )
+            fut = _attach_exog(fut)
+            fc = model.predict(fut)
+            if fc.empty or "yhat1" not in fc.columns:
+                break
+            last = fc.iloc[-1]
+            new_yhat = float(last["yhat1"]) if not pd.isna(last["yhat1"]) else 0.0
+            lc = next((c for c in fc.columns if "10.0%" in c), None)
+            uc = next((c for c in fc.columns if "90.0%" in c), None)
+            rows.append({
+                "ds":         last["ds"],
+                "yhat":       new_yhat,
+                "yhat_lower": float(last[lc]) if lc and not pd.isna(last[lc]) else new_yhat,
+                "yhat_upper": float(last[uc]) if uc and not pd.isna(last[uc]) else new_yhat,
+            })
+            # Добавляем предсказание в историю ВМЕСТЕ с экзогенными колонками,
+            # иначе следующий шаг получит NaN в последней строке history.
+            new_row = _attach_exog(pd.DataFrame({"ds": [last["ds"]], "y": [new_yhat]}))
+            history = pd.concat([history, new_row]).reset_index(drop=True)
+        out = pd.DataFrame(rows).reset_index(drop=True)
+    else:
+        future = model.make_future_dataframe(
+            df=train_df,
+            periods=periods,
+            n_historic_predictions=False,
+        )
+        future = _attach_exog(future)
+        forecast = model.predict(future)
+        out = forecast[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"}).copy()
+        lower_col = next((c for c in forecast.columns if "10.0%" in c), None)
+        upper_col = next((c for c in forecast.columns if "90.0%" in c), None)
+        out["yhat_lower"] = forecast[lower_col].values if lower_col else out["yhat"]
+        out["yhat_upper"] = forecast[upper_col].values if upper_col else out["yhat"]
+        out = out.iloc[-periods:].reset_index(drop=True)
 
-    lower_col = next((c for c in forecast.columns if "10.0%" in c), None)
-    upper_col = next((c for c in forecast.columns if "90.0%" in c), None)
-    out["yhat_lower"] = forecast[lower_col].values if lower_col else out["yhat"]
-    out["yhat_upper"] = forecast[upper_col].values if upper_col else out["yhat"]
+    for col in ("yhat", "yhat_lower", "yhat_upper"):
+        if out[col].isna().any():
+            fill_val = float(out[col].median())
+            if np.isnan(fill_val):
+                fill_val = 0.0
+            out[col] = out[col].fillna(fill_val)
 
-    return out.iloc[-periods:].reset_index(drop=True)
+    return out
 
 
 def save_prophet(model, path: str) -> None:
-    """Сохраняет NeuralProphet в torch-формате (.np)."""
-    from neuralprophet import save_model as _np_save
+    """Сохраняет NeuralProphet (поддерживает разные версии API)."""
+    import joblib as _joblib
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     save_path = path.replace(".json", "") + ".np"
-    _np_save(save_path, model)
+    try:
+        from neuralprophet import save_model as _np_save
+        _np_save(save_path, model)
+    except ImportError:
+        try:
+            from neuralprophet import save as _np_save
+            _np_save(model, save_path)
+        except (ImportError, TypeError):
+            _joblib.dump(model, save_path)
 
 
 def load_prophet(path: str):
-    """Загружает NeuralProphet из torch-формата."""
-    import torch
-    import neuralprophet
-    from neuralprophet import load_model as _np_load
+    """Загружает NeuralProphet (поддерживает разные версии API)."""
+    import joblib as _joblib
     load_path = path.replace(".json", "") + ".np"
-    # PyTorch 2.6 изменил дефолт weights_only=True, что ломает NeuralProphet.
-    torch.serialization.add_safe_globals([
-        getattr(neuralprophet.configure, cls)
-        for cls in dir(neuralprophet.configure)
-        if not cls.startswith("_")
-    ])
-    return _np_load(load_path)
+    try:
+        from neuralprophet import load_model as _np_load
+        return _np_load(load_path)
+    except ImportError:
+        try:
+            from neuralprophet import load as _np_load
+            return _np_load(load_path)
+        except (ImportError, TypeError):
+            return _joblib.load(load_path)
 
 
 # ===========================================================================

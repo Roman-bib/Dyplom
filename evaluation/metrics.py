@@ -47,13 +47,15 @@ def evaluate(
     y_pred,
     model_name: str = "Model",
     verbose: bool = True,
+    y_train: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
     Вычисляет MAE, RMSE, MAPE для пары (факт, прогноз).
+    Если передан y_train — дополнительно считает MASE.
 
     Returns
     -------
-    dict с ключами "MAE", "RMSE", "MAPE"
+    dict с ключами "MAE", "RMSE", "MAPE" (и "MASE" если y_train задан)
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -62,10 +64,61 @@ def evaluate(
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mape = safe_mape(y_true, y_pred)
 
+    result: Dict[str, float] = {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+
+    if y_train is not None:
+        y_train = np.asarray(y_train, dtype=float)
+        naive_mae = float(np.mean(np.abs(np.diff(y_train)))) + 1e-9
+        result["MASE"] = round(mae / naive_mae, 4)
+
     if verbose:
         print(f"  {model_name:<20} MAE={mae:8.2f}  RMSE={rmse:8.2f}  MAPE={mape:6.2f}%")
 
-    return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+    return result
+
+
+def peak_detection_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+) -> Dict[str, float]:
+    """
+    Precision / Recall / F1 / MCC для задачи «предсказать пик».
+    Пик = точка где y_true >= threshold.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    actual    = (y_true >= threshold).astype(int)
+    predicted = (y_pred >= threshold).astype(int)
+
+    if actual.sum() == 0:
+        return {"peak_precision": float("nan"), "peak_recall": float("nan"),
+                "peak_f1": float("nan"), "peak_mcc": float("nan")}
+
+    prec = float(precision_score(actual, predicted, zero_division=0))
+    rec  = float(recall_score(actual, predicted, zero_division=0))
+    f1   = float(f1_score(actual, predicted, zero_division=0))
+    try:
+        mcc = float(matthews_corrcoef(actual, predicted))
+    except Exception:
+        mcc = float("nan")
+
+    return {"peak_precision": round(prec, 4), "peak_recall": round(rec, 4),
+            "peak_f1": round(f1, 4), "peak_mcc": round(mcc, 4)}
+
+
+def peak_focused_mae(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+) -> float:
+    """MAE только на точках где y_true >= threshold."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = y_true >= threshold
+    if mask.sum() == 0:
+        return float("nan")
+    return float(np.mean(np.abs(y_true[mask] - y_pred[mask])))
 
 
 def print_comparison_table(results: Dict[str, Dict[str, float]]) -> None:

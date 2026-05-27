@@ -61,6 +61,10 @@ class FeatureBuilder:
     _ROLL_STD_NAMES  = ["rps_std_1h",  "rps_std_6h",  "rps_std_24h"]
     _EXTRA_NAMES = ["rps_diff", "hour", "day_of_week", "is_weekend"]
 
+    def __init__(self, exog_cols=None):
+        # exog_cols принимается для совместимости с Diplome-версией, не используется
+        self.exog_cols = exog_cols or []
+
     @property
     def FEATURE_COLS(self):
         return (
