@@ -359,7 +359,7 @@ def train_prophet(
         _ar_lags = 12
 
     param_grid = {
-        "n_changepoints":  [10, 30],
+        "n_changepoints":  [20],
         "trend_reg":       [0.1, 1.0],
         "seasonality_reg": [0.1, 1.0],
         "n_lags":          [0, _ar_lags],   # 0 = чистый Prophet; >0 = AR-Net
