@@ -492,26 +492,34 @@ def predict_prophet(
 
 
 def save_prophet(model, path: str) -> None:
-    """Сохраняет NeuralProphet в torch-формате (.np)."""
-    from neuralprophet import save_model as _np_save
+    """Сохраняет NeuralProphet (поддерживает разные версии API)."""
+    import joblib as _joblib
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     save_path = path.replace(".json", "") + ".np"
-    _np_save(save_path, model)
+    try:
+        from neuralprophet import save_model as _np_save
+        _np_save(save_path, model)
+    except ImportError:
+        try:
+            from neuralprophet import save as _np_save
+            _np_save(model, save_path)
+        except (ImportError, TypeError):
+            _joblib.dump(model, save_path)
 
 
 def load_prophet(path: str):
-    """Загружает NeuralProphet из torch-формата."""
-    import torch
-    import neuralprophet
-    from neuralprophet import load_model as _np_load
+    """Загружает NeuralProphet (поддерживает разные версии API)."""
+    import joblib as _joblib
     load_path = path.replace(".json", "") + ".np"
-    # PyTorch 2.6 изменил дефолт weights_only=True, что ломает NeuralProphet.
-    torch.serialization.add_safe_globals([
-        getattr(neuralprophet.configure, cls)
-        for cls in dir(neuralprophet.configure)
-        if not cls.startswith("_")
-    ])
-    return _np_load(load_path)
+    try:
+        from neuralprophet import load_model as _np_load
+        return _np_load(load_path)
+    except ImportError:
+        try:
+            from neuralprophet import load as _np_load
+            return _np_load(load_path)
+        except (ImportError, TypeError):
+            return _joblib.load(load_path)
 
 
 # ===========================================================================
