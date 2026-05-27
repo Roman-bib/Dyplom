@@ -278,12 +278,14 @@ class ModelComparison:
         preds = predict_xgboost(model, X_test)
         elapsed = time.time() - t0
 
-        mae_train = float(np.mean(np.abs(y_train.values - predict_xgboost(model, X_train))))
-        mae_val   = float(np.mean(np.abs(y_val.values   - predict_xgboost(model, X_val))))
+        y_tr_arr = np.asarray(y_train, dtype=float).flatten()
+        y_vl_arr = np.asarray(y_val,   dtype=float).flatten()
+        mae_train = float(np.mean(np.abs(y_tr_arr - predict_xgboost(model, X_train))))
+        mae_val   = float(np.mean(np.abs(y_vl_arr - predict_xgboost(model, X_val))))
 
         self._record("XGBoost", y_test, preds, peak_threshold, elapsed,
                      model_obj=model,
-                     y_train_for_mase=pd.concat([y_train, y_val]).values,
+                     y_train_for_mase=np.concatenate([y_tr_arr, y_vl_arr]),
                      mae_train=mae_train, mae_val=mae_val)
 
     def _fit_prophet(self, train, val, test, y_test, peak_threshold):
@@ -384,7 +386,10 @@ class ModelComparison:
 
             self._record("LSTM", y_test, preds, peak_threshold, elapsed,
                          model_obj=artifact,
-                         y_train_for_mase=pd.concat([y_train, y_val]).values,
+                         y_train_for_mase=np.concatenate([
+                             np.asarray(y_train, dtype=float).flatten(),
+                             np.asarray(y_val,   dtype=float).flatten(),
+                         ]),
                          mae_train=mae_train_lstm, mae_val=mae_val_lstm)
         except ImportError as e:
             print(f"  LSTM пропущен (нет TensorFlow): {e}")
