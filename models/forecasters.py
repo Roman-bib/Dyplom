@@ -335,6 +335,11 @@ def train_prophet(
     for col in exog_cols:
         train_df[col] = train_df[col].fillna(0)
         val_df[col]   = val_df[col].fillna(0)
+    # Колонки с нулевой дисперсией в train ломают NeuralProphet: StandardScaler
+    # внутри NP вычисляет (x - mean) / std, и при std=0 получает NaN для будущих
+    # строк (y=NaN), что вызывает "Future values of all user specified regressors
+    # not provided" — даже если мы явно заполнили колонку нулями через _attach_exog.
+    exog_cols = [c for c in exog_cols if train_df[c].nunique() > 1]
 
     freq   = _infer_freq(train_df["ds"])
     yearly = _enough_for_yearly(train_df["ds"])
@@ -440,6 +445,8 @@ def refit_prophet_full(
     train_val_df["y"] = train_val_df["y"].interpolate(method="linear").bfill().ffill()
     for col in exog_cols:
         train_val_df[col] = train_val_df[col].fillna(0)
+    # Колонки с нулевой дисперсией ломают NP-нормализацию при прогнозе (std=0 → NaN)
+    exog_cols = [c for c in exog_cols if train_val_df[c].nunique() > 1]
 
     freq   = _infer_freq(train_val_df["ds"])
     yearly = _enough_for_yearly(train_val_df["ds"])
