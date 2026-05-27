@@ -371,11 +371,21 @@ def train_prophet(
             m.add_future_regressor(col)
         m.fit(train_df, freq=freq)
 
-        forecast = m.predict(val_df)
-        mae = mean_absolute_error(
-            val_df["y"].values[-len(forecast):],
-            forecast["yhat1"].values,
-        )
+        # AR-модели (n_lags > 0) нуждаются в контексте train для предсказания val.
+        # Передаём train+val, берём только последние len(val_df) строк прогноза.
+        if params.get("n_lags", 0) > 0:
+            combined_pred = pd.concat([train_df, val_df]).reset_index(drop=True)
+            forecast_full = m.predict(combined_pred)
+            forecast = forecast_full.iloc[-len(val_df):].reset_index(drop=True)
+        else:
+            forecast = m.predict(val_df)
+
+        yhat  = forecast["yhat1"].values
+        ytrue = val_df["y"].values[-len(yhat):]
+        mask  = ~np.isnan(yhat)
+        if mask.sum() == 0:
+            continue   # комбинация без валидных предсказаний — пропускаем
+        mae = mean_absolute_error(ytrue[mask], yhat[mask])
 
         if mae < best_mae:
             best_mae   = mae
