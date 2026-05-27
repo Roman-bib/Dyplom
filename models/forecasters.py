@@ -18,6 +18,11 @@ import joblib
 import numpy as np
 import pandas as pd
 
+# NumPy 2.0 удалил np.NaN; NeuralProphet всё ещё использует его внутри.
+# Патч должен быть применён ДО импорта neuralprophet.
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan  # type: ignore[attr-defined]
+
 
 # ===========================================================================
 # XGBoost
