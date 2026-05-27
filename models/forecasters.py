@@ -495,19 +495,29 @@ def predict_prophet(
         freq = _infer_freq(train_df["ds"])
 
     exog_cols = getattr(model, "_exog_cols", [])
-    n_lags = getattr(model, "n_lags", 0)
+    # NeuralProphet хранит n_lags в config_ar.n_lags, а не как прямой атрибут.
+    # Используем _best_params (который мы сами пишем в refit_prophet_full).
+    _bp = getattr(model, "_best_params", {}) or {}
+    n_lags = int(
+        getattr(model, "n_lags", None)
+        or getattr(getattr(model, "config_ar", None), "n_lags", None)
+        or _bp.get("n_lags", 0)
+        or 0
+    )
 
     if n_lags and n_lags > 0:
         # NeuralProphet с n_forecasts=1 принудительно ставит periods=1,
         # поэтому multi-step прогноз делается итеративно: каждый шаг
         # добавляет своё предсказание обратно в историю как "known y".
+        # n_historic_predictions=n_lags даёт AR-контекст (последние n_lags строк),
+        # иначе модель предсказывает без авторегрессивной компоненты.
         history = train_df[["ds", "y"]].copy()
         rows: list = []
         for step in range(periods):
             fut = model.make_future_dataframe(
                 df=history,
                 periods=model.n_forecasts,
-                n_historic_predictions=False,
+                n_historic_predictions=int(n_lags),
             )
             if exog_cols and future_regressors is not None:
                 fut["ds"] = pd.to_datetime(fut["ds"])
