@@ -557,7 +557,10 @@ def predict_prophet(
         # добавляет своё предсказание обратно в историю как "known y".
         # n_historic_predictions=n_lags даёт AR-контекст (последние n_lags строк),
         # иначе модель предсказывает без авторегрессивной компоненты.
-        history = train_df[["ds", "y"]].copy()
+        # История должна содержать экзогенные колонки — make_future_dataframe
+        # валидирует входной df на наличие зарегистрированных регрессоров ещё
+        # до того, как мы сами успеваем их добавить через _attach_exog.
+        history = _attach_exog(train_df[["ds", "y"]].copy())
         rows: list = []
         for step in range(periods):
             fut = model.make_future_dataframe(
@@ -579,7 +582,9 @@ def predict_prophet(
                 "yhat_lower": float(last[lc]) if lc and not pd.isna(last[lc]) else new_yhat,
                 "yhat_upper": float(last[uc]) if uc and not pd.isna(last[uc]) else new_yhat,
             })
-            new_row = pd.DataFrame({"ds": [last["ds"]], "y": [new_yhat]})
+            # Добавляем предсказание в историю ВМЕСТЕ с экзогенными колонками,
+            # иначе следующий шаг получит NaN в последней строке history.
+            new_row = _attach_exog(pd.DataFrame({"ds": [last["ds"]], "y": [new_yhat]}))
             history = pd.concat([history, new_row]).reset_index(drop=True)
         out = pd.DataFrame(rows).reset_index(drop=True)
     else:
