@@ -293,7 +293,6 @@ def _build_neuralprophet(params: dict, yearly: bool):
         n_forecasts=1,
         n_lags=params.get("n_lags", 0),
         quantiles=[0.1, 0.9],
-        early_stopping=True,
     )
 
 
