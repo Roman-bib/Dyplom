@@ -37,6 +37,7 @@ from models.forecasters import (
     train_xgboost, train_xgboost_random_search,
     predict_xgboost,
     train_lstm_random_search,
+    train_fbprophet, predict_fbprophet,
 )
 from evaluation.metrics import (
     evaluate, print_comparison_table,
@@ -86,6 +87,7 @@ class ModelComparison:
         test: pd.DataFrame,
         include_prophet: bool = True,
         include_lstm: bool = True,
+        include_fbprophet: bool = True,
         lstm_window_size: int = 24,
         lstm_epochs: int = 80,
         force_retrain: bool = False,
@@ -186,6 +188,10 @@ class ModelComparison:
                     peak_threshold=peak_threshold,
                 )
 
+        # --- 4. Facebook Prophet (классический, опционально) ---
+        if include_fbprophet:
+            self._fit_fbprophet(train, val, test, y_test, peak_threshold, force_retrain)
+
         # --- Итоговая таблица и выбор победителя ---
         self.winner_ = self._select_winner()
         print_comparison_table(self.results_)
@@ -218,6 +224,12 @@ class ModelComparison:
             save_prophet(model, prophet_path)
             print(f"Best model (Prophet) saved -> {prophet_path}")
             return prophet_path
+        if name == "FBProphet":
+            from models.forecasters import save_fbprophet
+            fb_path = os.path.join(self.model_save_dir, "best_FBProphet.json")
+            save_fbprophet(model, fb_path)
+            print(f"Best model (FBProphet) saved -> {fb_path}")
+            return fb_path
         joblib.dump(model, path)
         print(f"Best model ({name}) saved -> {path}")
         return path
@@ -412,6 +424,44 @@ class ModelComparison:
             print(f"  LSTM пропущен (нет TensorFlow): {e}")
         except Exception as e:
             print(f"  LSTM пропущен: {e}")
+
+    def _fit_fbprophet(self, train, val, test, y_test, peak_threshold, force_retrain=False):
+        print("\n[4] Facebook Prophet (классический)...")
+        fb_path = os.path.join(self.model_save_dir, "fbprophet.json")
+        try:
+            from models.forecasters import load_fbprophet, predict_fbprophet
+
+            if not force_retrain and os.path.exists(fb_path):
+                print("  Загружаем сохранённую модель...")
+                model = load_fbprophet(fb_path)
+            else:
+                import config as _cfg
+                _use_holidays = getattr(_cfg, "PROPHET_USE_HOLIDAYS", False)
+                _country      = getattr(_cfg, "PROPHET_COUNTRY_CODE", "RU")
+
+                train_val = pd.concat([train, val]).sort_values("ds").reset_index(drop=True)
+                t0 = time.time()
+                model = train_fbprophet(
+                    train_df=train_val,
+                    use_holidays=_use_holidays,
+                    country_code=_country,
+                    verbose=True,
+                )
+                elapsed = time.time() - t0
+                from models.forecasters import save_fbprophet
+                save_fbprophet(model, fb_path)
+
+            pred_df = predict_fbprophet(model, periods=len(test), history_ds=train["ds"])
+            preds = np.clip(pred_df["yhat"].values[:len(y_test)], 0, None)
+
+            elapsed = locals().get("elapsed", 0.0)
+            self._record(
+                "FBProphet", y_test, preds, peak_threshold, elapsed,
+                model_obj=model,
+                y_train_for_mase=pd.concat([train, val])["y"].values,
+            )
+        except Exception as e:
+            print(f"  FBProphet пропущен: {e}")
 
     def _select_winner(self) -> str:
         """Выбирает победителя по primary_metric."""

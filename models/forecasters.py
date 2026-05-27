@@ -653,6 +653,74 @@ def load_prophet(path: str):
 
 
 # ===========================================================================
+# Facebook Prophet (классический)
+# ===========================================================================
+
+def train_fbprophet(
+    train_df: pd.DataFrame,
+    use_holidays: bool = False,
+    country_code: str = "RU",
+    verbose: bool = True,
+):
+    """Обучает классический Facebook Prophet на train_df (ds, y)."""
+    from prophet import Prophet
+    import logging
+    logging.getLogger("prophet").setLevel(logging.WARNING)
+    logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+
+    if "ds" not in train_df.columns or "y" not in train_df.columns:
+        raise ValueError("train_df должен содержать колонки 'ds' и 'y'")
+
+    df = train_df[["ds", "y"]].copy().reset_index(drop=True)
+    df["ds"] = pd.to_datetime(df["ds"])
+    df["y"] = df["y"].interpolate(method="linear").bfill().ffill()
+
+    yearly = _enough_for_yearly(df["ds"])
+
+    model = Prophet(
+        daily_seasonality=True,
+        weekly_seasonality=True,
+        yearly_seasonality=yearly,
+        changepoint_prior_scale=0.05,
+        seasonality_prior_scale=10.0,
+        interval_width=0.8,
+    )
+    if use_holidays:
+        try:
+            model.add_country_holidays(country_name=country_code)
+        except Exception:
+            pass
+
+    model.fit(df)
+    return model
+
+
+def predict_fbprophet(
+    model,
+    periods: int,
+    history_ds: Optional[pd.Series] = None,
+) -> pd.DataFrame:
+    """Предсказывает periods шагов вперёд, возвращает df с yhat."""
+    freq = _infer_freq(history_ds) if history_ds is not None else "h"
+    future = model.make_future_dataframe(periods=periods, freq=freq)
+    forecast = model.predict(future)
+    return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].iloc[-periods:].reset_index(drop=True)
+
+
+def save_fbprophet(model, path: str) -> None:
+    from prophet.serialize import model_to_json
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(model_to_json(model))
+
+
+def load_fbprophet(path: str):
+    from prophet.serialize import model_from_json
+    with open(path, "r", encoding="utf-8") as f:
+        return model_from_json(f.read())
+
+
+# ===========================================================================
 # LSTM
 # ===========================================================================
 
