@@ -305,9 +305,16 @@ class ModelComparison:
             _exog = [c for c in getattr(_cfg, "EXOG_COLS", [])
                      if c in train.columns]
 
+            # NeuralProphet получает ds+y без RobustSTL, но с заполнением пропусков
+            # (интерполяция — шаг пайплайна, общий для всех моделей)
+            def _fill_y(df):
+                d = df[["ds", "y"] + [c for c in df.columns if c not in ("ds","y")]].copy()
+                d["y"] = d["y"].interpolate(method="time").bfill().ffill()
+                return d.reset_index(drop=True)
+
             best_model = train_prophet(
-                train_df=train,
-                val_df=val,
+                train_df=_fill_y(train),
+                val_df=_fill_y(val),
                 save_path=None,        # сохраним позже после refit
                 use_holidays=_use_holidays,
                 country_code=_country,
@@ -317,7 +324,7 @@ class ModelComparison:
             # После grid-search дообучаем на train+val для финального предсказания
             final_model = refit_prophet_full(
                 base_model=best_model,
-                train_val_df=pd.concat([train, val]).sort_values("ds").reset_index(drop=True),
+                train_val_df=_fill_y(pd.concat([train, val]).sort_values("ds").reset_index(drop=True)),
                 use_holidays=_use_holidays,
                 country_code=_country,
                 exog_cols=_exog,
