@@ -293,6 +293,9 @@ def _build_neuralprophet(params: dict, yearly: bool):
         n_forecasts=1,
         n_lags=params.get("n_lags", 0),
         quantiles=[0.1, 0.9],
+        epochs=150,
+        num_hidden_layers=2,
+        d_hidden=64,
     )
 
 
