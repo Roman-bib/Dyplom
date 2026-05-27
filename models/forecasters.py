@@ -358,14 +358,12 @@ def train_prophet(
     else:
         _ar_lags = 12
 
-    # Для часовых данных добавляем лаг 168ч (1 неделя) — недельная AR-компонента.
-    _week_lags = 168 if _step_min >= 30 else _ar_lags
     param_grid = {
         "n_changepoints":  [10, 30],
         "trend_reg":       [0.1, 1.0],
         "seasonality_reg": [0.1, 1.0],
-        "n_lags":          [0, _ar_lags, _week_lags],  # 0=Prophet, 24h=суточный AR, 168h=недельный AR
-        "ar_reg":          [0.01, 0.1],
+        "n_lags":          [0, _ar_lags],   # 0 = чистый Prophet; >0 = AR-Net
+        "ar_reg":          [0.1],
     }
     all_params = [dict(zip(param_grid.keys(), v))
                   for v in product(*param_grid.values())]
