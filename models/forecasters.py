@@ -514,7 +514,18 @@ def predict_prophet(
     out["yhat_lower"] = forecast[lower_col].values if lower_col else out["yhat"]
     out["yhat_upper"] = forecast[upper_col].values if upper_col else out["yhat"]
 
-    return out.iloc[-periods:].reset_index(drop=True)
+    out = out.iloc[-periods:].reset_index(drop=True)
+
+    # AR-модели (n_lags > 0) могут давать NaN в первых шагах из-за прогрева.
+    # Заполняем медианой, чтобы не падал mean_absolute_error ниже по стеку.
+    for col in ("yhat", "yhat_lower", "yhat_upper"):
+        if out[col].isna().any():
+            fill_val = out[col].median()
+            if np.isnan(fill_val):
+                fill_val = 0.0
+            out[col] = out[col].fillna(fill_val)
+
+    return out
 
 
 def save_prophet(model, path: str) -> None:
