@@ -84,6 +84,38 @@ class PeakEvent:
 
 
 # ---------------------------------------------------------------------------
+# Isolation Forest — детектор аномальных пиков на остатках ряда
+# ---------------------------------------------------------------------------
+
+class IsolationForestAnomalyDetector:
+    """
+    Обучается на остатках r_t после RobustSTL-декомпозиции.
+    Аномальный пик (стохастический) → recommended_replicas умножается на k_safety.
+    """
+
+    def __init__(self, contamination: float = 0.05, n_estimators: int = 100):
+        self.contamination = contamination
+        self.n_estimators = n_estimators
+        self._model = None
+
+    def fit(self, residuals) -> "IsolationForestAnomalyDetector":
+        from sklearn.ensemble import IsolationForest
+        r = np.asarray(residuals, dtype=float).reshape(-1, 1)
+        self._model = IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=42,
+        )
+        self._model.fit(r)
+        return self
+
+    def is_anomaly(self, value: float) -> bool:
+        if self._model is None:
+            return False
+        return bool(self._model.predict([[float(value)]])[0] == -1)
+
+
+# ---------------------------------------------------------------------------
 # Детектор
 # ---------------------------------------------------------------------------
 
@@ -106,6 +138,7 @@ class PeakDetector:
     critical_ratio    : доля от порога для critical
     spike_growth      : предиктивный рост current→predicted, при котором
                         выдаётся «info» даже если ratio < warning_ratio
+    k_safety          : коэффициент запаса реплик при аномальном пике (IF)
     """
 
     def __init__(
@@ -121,6 +154,7 @@ class PeakDetector:
         warning_ratio: float = 0.70,
         critical_ratio: float = 0.85,
         spike_growth: float = 1.2,
+        k_safety: float = 1.5,
     ):
         # Обратная совместимость: старое имя «rolling_std» маппим на новое
         if method == "rolling_std":
@@ -130,6 +164,8 @@ class PeakDetector:
         self.k = k
         self.percentile = percentile
         self.window = window
+        self.k_safety = float(k_safety)
+        self._if_detector: Optional[IsolationForestAnomalyDetector] = None
         self.target_rps = float(target_rps_per_replica)
         self.min_replicas = int(min_replicas)
         self.max_replicas = int(max_replicas)
@@ -176,6 +212,12 @@ class PeakDetector:
         else:
             raise ValueError(f"Неизвестный метод: {self.method}")
 
+        return self
+
+    def fit_anomaly_detector(self, residuals) -> "PeakDetector":
+        """Обучает Isolation Forest на остатках r_t из RobustSTL."""
+        self._if_detector = IsolationForestAnomalyDetector()
+        self._if_detector.fit(residuals)
         return self
 
     @property
@@ -261,12 +303,17 @@ class PeakDetector:
         Returns
         -------
         DataFrame: timestamp, rps, predicted, threshold,
-                   severity, recommended_replicas, is_peak
+                   severity, recommended_replicas, is_peak, is_anomaly
         """
         records = []
         rolling_threshold = self.threshold
         history_buffer: list = list(self._fit_history.values) \
             if self._fit_history is not None else []
+
+        # Скользящее среднее для вычисления остатка (приближение r_t)
+        rps_arr = np.asarray(rps_series.values, dtype=float)
+        roll_size = min(self.window, len(rps_arr))
+        rolling_med = pd.Series(rps_arr).rolling(roll_size, min_periods=1).median().values
 
         for i, (ts, cur, pred) in enumerate(zip(
             rps_series.index, rps_series.values, predicted_series.values,
@@ -282,20 +329,37 @@ class PeakDetector:
                 tail = history_buffer[-self.window:]
                 rolling_threshold = float(np.percentile(tail, self.percentile))
 
+            # Остаток ≈ отклонение от скользящей медианы (приближение r_t)
+            residual = float(cur) - float(rolling_med[i])
+            is_anom = (
+                self._if_detector.is_anomaly(residual)
+                if self._if_detector is not None else False
+            )
+
             event = self.detect(
                 predicted_rps=float(pred),
                 current_rps=float(cur),
                 timestamp=pd.Timestamp(ts),
                 threshold_override=rolling_threshold,
             )
+
+            # При аномальном пике — добавляем запас реплик
+            replicas = event.recommended_replicas
+            if is_anom and event.is_peak:
+                replicas = int(np.clip(
+                    np.ceil(float(pred) * self.k_safety / max(self.target_rps, 1)),
+                    self.min_replicas, self.max_replicas,
+                ))
+
             records.append({
                 "timestamp": event.timestamp,
                 "rps": event.current_rps,
                 "predicted": event.predicted_rps,
                 "threshold": event.threshold,
                 "severity": event.severity,
-                "recommended_replicas": event.recommended_replicas,
+                "recommended_replicas": replicas,
                 "is_peak": event.is_peak,
+                "is_anomaly": is_anom,
             })
 
             # Обновляем историю для адаптивного порога
