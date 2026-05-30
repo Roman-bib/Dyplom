@@ -150,10 +150,11 @@ class ModelComparison:
         try:
             from neuralprophet import NeuralProphet as _NP
             if isinstance(model, _NP):
+                from models.forecasters import save_prophet
                 np_path = path or os.path.join(
                     self.model_save_dir, f"best_{name}.np"
                 )
-                model.save(np_path)
+                save_prophet(model, np_path)
                 print(f"Best model ({name}) saved -> {np_path}")
                 return np_path
         except ImportError:
