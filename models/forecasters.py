@@ -360,14 +360,18 @@ def train_prophet(
         _ar_lags = 12
 
     param_grid = {
-        "n_changepoints":  [20],
-        "trend_reg":       [0.1, 1.0],
-        "seasonality_reg": [0.1, 1.0],
+        "n_changepoints":  [10, 20, 30],
+        "trend_reg":       [0.05, 0.1, 1.0],
+        "seasonality_reg": [0.05, 0.1, 1.0],
         "n_lags":          [0, _ar_lags],   # 0 = чистый Prophet; >0 = AR-Net
-        "ar_reg":          [0.1],
+        "ar_reg":          [0.05, 0.1],
     }
     all_params = [dict(zip(param_grid.keys(), v))
                   for v in product(*param_grid.values())]
+    # Ограничиваем случайной выборкой из полного grid
+    max_evals = min(len(all_params), 36)
+    rng_grid = __import__("random").Random(42)
+    all_params = rng_grid.sample(all_params, max_evals)
 
     best_model = None
     best_params = None
