@@ -17,6 +17,24 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Tuple
 
+try:
+    import holidays as _hol
+    _RU_HOL = set(_hol.Russia(years=range(2019, 2036)).keys())
+except ImportError:
+    _RU_HOL = set()
+
+def _days_to_next_holiday(dt) -> int:
+    for i in range(1, 8):
+        if (dt + pd.Timedelta(days=i)).date() in _RU_HOL:
+            return i
+    return 7
+
+def _days_since_last_holiday(dt) -> int:
+    for i in range(1, 8):
+        if (dt - pd.Timedelta(days=i)).date() in _RU_HOL:
+            return i
+    return 7
+
 def _infer_step_minutes(index: pd.DatetimeIndex) -> float:
     """
     Определяет шаг временного ряда в минутах по разности соседних меток.
@@ -59,7 +77,8 @@ class FeatureBuilder:
     _LAG_NAMES = ["rps_lag_1h", "rps_lag_24h", "rps_lag_168h"]
     _ROLL_MEAN_NAMES = ["rps_mean_1h", "rps_mean_6h", "rps_mean_24h"]
     _ROLL_STD_NAMES  = ["rps_std_1h",  "rps_std_6h",  "rps_std_24h"]
-    _EXTRA_NAMES = ["rps_diff", "hour", "day_of_week", "is_weekend"]
+    _EXTRA_NAMES = ["rps_diff", "hour", "day_of_week", "is_weekend",
+                    "days_to_holiday", "days_since_holiday"]
 
     def __init__(self, exog_cols=None):
         # Экзогенные признаки (is_holiday/is_promo/is_campaign и т.п.) известны
@@ -120,6 +139,15 @@ class FeatureBuilder:
         data["hour"]        = data.index.hour
         data["day_of_week"] = data.index.dayofweek
         data["is_weekend"]  = (data.index.dayofweek >= 5).astype(int)
+
+        # --- 5. Эффект ореола праздника ---
+        if _RU_HOL:
+            dates = data.index.normalize()
+            data["days_to_holiday"]    = [_days_to_next_holiday(d) for d in dates]
+            data["days_since_holiday"] = [_days_since_last_holiday(d) for d in dates]
+        else:
+            data["days_to_holiday"]    = 7
+            data["days_since_holiday"] = 7
 
         # Экзогенные признаки: заполняем пропуски нулями, чтобы dropna() не
         # вырезал валидные строки (NaN в exog не означает отсутствие данных).
