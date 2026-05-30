@@ -241,10 +241,19 @@ def predict_neural_prophet(
 # ---------------------------------------------------------------------------
 
 def save_neural_prophet(model, path: str) -> None:
-    """Сохраняет NeuralProphet через штатный метод (.np файл)."""
+    """Сохраняет NeuralProphet (совместимость с разными версиями API)."""
     np_path = path if path.endswith(".np") else path + ".np"
     os.makedirs(os.path.dirname(np_path) or ".", exist_ok=True)
-    model.save(np_path)
+    try:
+        from neuralprophet import save_model as _np_save
+        _np_save(np_path, model)
+    except (ImportError, TypeError):
+        try:
+            from neuralprophet import save as _np_save
+            _np_save(model, np_path)
+        except (ImportError, TypeError):
+            import joblib
+            joblib.dump(model, np_path)
 
 
 def load_neural_prophet(path: str):
