@@ -47,6 +47,7 @@ class ModelComparison:
         self,
         model_save_dir: str = "./saved_models",
         primary_metric: str = "MAE",
+        exog_cols=None,
     ):
         self.model_save_dir = model_save_dir
         self.primary_metric = primary_metric
@@ -54,7 +55,15 @@ class ModelComparison:
         self.models_: Dict[str, object] = {}
         self.predictions_: Dict[str, np.ndarray] = {}
         self.winner_: Optional[str] = None
-        self._builder = FeatureBuilder()
+        if exog_cols is None:
+            try:
+                import config as _cfg
+                exog_cols = getattr(_cfg, "EXOG_COLS", [])
+            except Exception:
+                exog_cols = []
+        self.exog_cols = list(exog_cols)
+        # FeatureBuilder включит exog в признаки только если они есть в данных.
+        self._builder = FeatureBuilder(exog_cols=self.exog_cols)
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -108,7 +117,7 @@ class ModelComparison:
 
         # --- Итоговая таблица и выбор победителя ---
         self.winner_ = self._select_winner()
-        print_comparison_table(self.results_)
+        print_comparison_table(self.results_, primary_metric=self.primary_metric)
         print(f"\nЛучшая модель по {self.primary_metric}: {self.winner_}")
         print("=" * 60)
 

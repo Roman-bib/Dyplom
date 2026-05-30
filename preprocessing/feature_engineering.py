@@ -62,8 +62,10 @@ class FeatureBuilder:
     _EXTRA_NAMES = ["rps_diff", "hour", "day_of_week", "is_weekend"]
 
     def __init__(self, exog_cols=None):
-        # exog_cols принимается для совместимости с Diplome-версией, не используется
-        self.exog_cols = exog_cols or []
+        # Экзогенные признаки (is_holiday/is_promo/is_campaign и т.п.) известны
+        # заранее и используются как обычные признаки в XGBoost/LSTM, если они
+        # присутствуют в данных. См. config.EXOG_COLS.
+        self.exog_cols = list(exog_cols) if exog_cols else []
 
     @property
     def FEATURE_COLS(self):
@@ -72,6 +74,7 @@ class FeatureBuilder:
             + self._ROLL_MEAN_NAMES
             + self._ROLL_STD_NAMES
             + self._EXTRA_NAMES
+            + list(self.exog_cols)
         )
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -117,6 +120,12 @@ class FeatureBuilder:
         data["hour"]        = data.index.hour
         data["day_of_week"] = data.index.dayofweek
         data["is_weekend"]  = (data.index.dayofweek >= 5).astype(int)
+
+        # Экзогенные признаки: заполняем пропуски нулями, чтобы dropna() не
+        # вырезал валидные строки (NaN в exog не означает отсутствие данных).
+        for col in self.exog_cols:
+            if col in data.columns:
+                data[col] = data[col].fillna(0)
 
         data = data.dropna()
         return data

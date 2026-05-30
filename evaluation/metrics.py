@@ -48,10 +48,16 @@ def evaluate(
     model_name: str = "Model",
     verbose: bool = True,
     y_train: Optional[np.ndarray] = None,
+    season_period: int = 1,
 ) -> Dict[str, float]:
     """
     Вычисляет MAE, RMSE, MAPE для пары (факт, прогноз).
-    Если передан y_train — дополнительно считает MASE.
+
+    Если передан y_train — дополнительно считает MASE = MAE / MAE(naive),
+    где naive — СЕЗОННЫЙ наивный прогноз с периодом season_period
+    (ŷ[t] = y[t - season_period]). При season_period=1 это обычный
+    random-walk naive (lag-1). Для 5-мин данных с суточной сезонностью
+    передавайте season_period=288 (24ч).
 
     Returns
     -------
@@ -68,7 +74,11 @@ def evaluate(
 
     if y_train is not None:
         y_train = np.asarray(y_train, dtype=float)
-        naive_mae = float(np.mean(np.abs(np.diff(y_train)))) + 1e-9
+        m = max(1, int(season_period))
+        if len(y_train) > m:
+            naive_mae = float(np.mean(np.abs(y_train[m:] - y_train[:-m]))) + 1e-9
+        else:
+            naive_mae = float(np.mean(np.abs(np.diff(y_train)))) + 1e-9
         result["MASE"] = round(mae / naive_mae, 4)
 
     if verbose:
@@ -121,7 +131,8 @@ def peak_focused_mae(
     return float(np.mean(np.abs(y_true[mask] - y_pred[mask])))
 
 
-def print_comparison_table(results: Dict[str, Dict[str, float]]) -> None:
+def print_comparison_table(results: Dict[str, Dict[str, float]],
+                           primary_metric: str = "MAE") -> None:
     """
     Выводит итоговую таблицу сравнения моделей.
 
@@ -137,8 +148,9 @@ def print_comparison_table(results: Dict[str, Dict[str, float]]) -> None:
     if not results:
         return
 
-    # Находим победителя по MAPE
-    winner = min(results, key=lambda n: results[n].get("MAPE", float("inf")))
+    # Победитель определяется по той же метрике, что и ModelComparison
+    # (по умолчанию MAE), чтобы метка ★ совпадала с .best_model().
+    winner = min(results, key=lambda n: results[n].get(primary_metric, float("inf")))
 
     header = f"\n{'Модель':<22} {'MAE':>9} {'RMSE':>9} {'MAPE%':>7} {'Время,с':>9}"
     sep = "-" * 62
@@ -154,7 +166,7 @@ def print_comparison_table(results: Dict[str, Dict[str, float]]) -> None:
             f" {m['MAPE']:>6.2f}%{t_str}"
         )
     print(sep)
-    print(f"  [*] - best model by MAPE\n")
+    print(f"  [*] - best model by {primary_metric}\n")
 
 
 def plot_forecast(
@@ -229,6 +241,9 @@ def plot_all_forecasts(
     predictions_dict: Dict[str, np.ndarray],
     save_path: Optional[str] = None,
     zoom: bool = False,
+    show: bool = True,
+    legend_loc: str = "upper right",
+    legend_fontsize: int = 9,
 ) -> None:
     """
     Один график: полный ряд (zoom=False) или только тест-период (zoom=True).
@@ -264,13 +279,13 @@ def plot_all_forecasts(
 
     ax.set_xlabel("Время")
     ax.set_ylabel("RPS")
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=legend_fontsize, loc=legend_loc)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path, dpi=150)
         print(f"Saved: {save_path}")
-    else:
+    if show:
         plt.show()
     plt.close(fig)

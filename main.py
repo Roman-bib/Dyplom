@@ -15,7 +15,7 @@
   python main.py demo
   python main.py train --synthetic
 """
-
+g
 import argparse
 import os
 import sys
