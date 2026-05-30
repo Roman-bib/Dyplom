@@ -294,6 +294,7 @@ def _build_neuralprophet(params: dict, yearly: bool):
         n_lags=params.get("n_lags", 0),
         quantiles=[0.1, 0.9],
         epochs=150,
+        trainer_config={"enable_progress_bar": True},
     )
 
 
