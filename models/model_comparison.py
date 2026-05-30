@@ -221,22 +221,22 @@ class ModelComparison:
                             label: str = "[3/3]"):
         print(f"\n{label} NeuralProphet (AR-Net + декомпозиция)...")
         try:
-            from models.forecasters import train_prophet, predict_prophet
+            from models.neural_prophet_model import (
+                train_neural_prophet,
+                predict_neural_prophet,
+            )
             t0 = time.time()
-            save_path = os.path.join(self.model_save_dir, "neural_prophet.json")
-            model, best_params = train_prophet(
+            save_path = os.path.join(self.model_save_dir, "neural_prophet")
+            model = train_neural_prophet(
                 train_df=train,
                 val_df=val,
                 save_path=save_path,
-                verbose=True,
             )
             train_val = pd.concat([train, val]).sort_values("ds")
-            pred_df = predict_prophet(
-                model, periods=len(test),
-                history_ds=train_val["ds"],
-                best_params=best_params,
+            preds = predict_neural_prophet(
+                model, train_val_df=train_val, test_df=test
             )
-            preds = np.clip(pred_df["yhat"].values[:len(y_test)], 0, None)
+            preds = preds[: len(y_test)]
             elapsed = time.time() - t0
             metrics = evaluate(y_test.values, preds, "NeuralProphet", verbose=True)
             metrics["train_time_s"] = round(elapsed, 2)
