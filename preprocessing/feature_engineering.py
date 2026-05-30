@@ -19,9 +19,38 @@ from typing import Optional, Tuple
 
 try:
     import holidays as _hol
-    _RU_HOL = set(_hol.Russia(years=range(2019, 2036)).keys())
+    _RU_HOL_DICT = dict(_hol.Russia(years=range(2019, 2036)))
+    _RU_HOL      = set(_RU_HOL_DICT.keys())
 except ImportError:
-    _RU_HOL = set()
+    _RU_HOL_DICT = {}
+    _RU_HOL      = set()
+
+# Веса праздников по силе влияния на трафик (1.0 = базовый)
+_HOLIDAY_WEIGHTS = {
+    "Новый год":                          3.0,
+    "New Year's Day":                     3.0,
+    "Рождество Христово":                 1.5,
+    "Christmas Day":                      1.5,
+    "День защитника Отечества":           1.8,
+    "Defender of the Fatherland Day":     1.8,
+    "Международный женский день":         2.0,
+    "International Women's Day":          2.0,
+    "Праздник Весны и Труда":             1.6,
+    "Spring and Labour Day":              1.6,
+    "День Победы":                        1.7,
+    "Victory Day":                        1.7,
+    "День России":                        1.2,
+    "Russia Day":                         1.2,
+    "День народного единства":            1.1,
+    "National Unity Day":                 1.1,
+}
+
+def _get_holiday_weight(date) -> float:
+    name = _RU_HOL_DICT.get(date, "")
+    for key, w in _HOLIDAY_WEIGHTS.items():
+        if key.lower() in name.lower():
+            return w
+    return 1.0 if date in _RU_HOL else 0.0
 
 def _days_to_next_holiday(dt) -> int:
     for i in range(1, 8):
@@ -34,6 +63,18 @@ def _days_since_last_holiday(dt) -> int:
         if (dt - pd.Timedelta(days=i)).date() in _RU_HOL:
             return i
     return 7
+
+def _nearest_holiday_weight(dt) -> float:
+    """Вес ближайшего праздника в окне ±7 дней."""
+    for i in range(0, 8):
+        d = (dt + pd.Timedelta(days=i)).date()
+        if d in _RU_HOL:
+            return _get_holiday_weight(d)
+    for i in range(1, 8):
+        d = (dt - pd.Timedelta(days=i)).date()
+        if d in _RU_HOL:
+            return _get_holiday_weight(d)
+    return 0.0
 
 def _infer_step_minutes(index: pd.DatetimeIndex) -> float:
     """
@@ -78,7 +119,7 @@ class FeatureBuilder:
     _ROLL_MEAN_NAMES = ["rps_mean_1h", "rps_mean_6h", "rps_mean_24h"]
     _ROLL_STD_NAMES  = ["rps_std_1h",  "rps_std_6h",  "rps_std_24h"]
     _EXTRA_NAMES = ["rps_diff", "hour", "day_of_week", "is_weekend",
-                    "days_to_holiday", "days_since_holiday"]
+                    "days_to_holiday", "days_since_holiday", "holiday_weight"]
 
     def __init__(self, exog_cols=None):
         # Экзогенные признаки (is_holiday/is_promo/is_campaign и т.п.) известны
@@ -145,9 +186,11 @@ class FeatureBuilder:
             dates = data.index.normalize()
             data["days_to_holiday"]    = [_days_to_next_holiday(d) for d in dates]
             data["days_since_holiday"] = [_days_since_last_holiday(d) for d in dates]
+            data["holiday_weight"]     = [_nearest_holiday_weight(d) for d in dates]
         else:
             data["days_to_holiday"]    = 7
             data["days_since_holiday"] = 7
+            data["holiday_weight"]     = 0.0
 
         # Экзогенные признаки: заполняем пропуски нулями, чтобы dropna() не
         # вырезал валидные строки (NaN в exog не означает отсутствие данных).
