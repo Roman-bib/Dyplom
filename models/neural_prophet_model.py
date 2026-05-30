@@ -82,40 +82,59 @@ def _auto_n_lags(ds: pd.Series) -> int:
 # Обучение
 # ---------------------------------------------------------------------------
 
+def _build_np_model(n_lags, n_changepoints, trend_reg, seasonality_reg,
+                    ar_reg, yearly, epochs):
+    from neuralprophet import NeuralProphet
+    kwargs = dict(
+        n_forecasts=1,
+        n_lags=n_lags,
+        n_changepoints=n_changepoints,
+        trend_reg=trend_reg,
+        seasonality_reg=seasonality_reg,
+        ar_reg=ar_reg,
+        yearly_seasonality=yearly,
+        weekly_seasonality=True,
+        daily_seasonality=True,
+        epochs=epochs,
+        trainer_config={"enable_progress_bar": True},
+    )
+    try:
+        return NeuralProphet(**kwargs)
+    except TypeError:
+        kwargs.pop("trainer_config", None)
+        return NeuralProphet(**kwargs)
+
+
 def train_neural_prophet(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     n_lags: Optional[int] = None,
     epochs: int = 50,
-    batch_size: int = 64,
-    learning_rate: float = 0.001,
     save_path: Optional[str] = None,
     verbose: bool = True,
+    max_evals: int = 36,
 ) -> object:
     """
-    Обучает NeuralProphet с AR-Net компонентом.
+    Обучает NeuralProphet с grid-search по гиперпараметрам.
 
     КРИТИЧНО: train_df и val_df — строго разные временные срезы.
-    Обучение идёт ТОЛЬКО на train_df, оценка — на val_df.
 
     Parameters
     ----------
     train_df, val_df : DataFrame с колонками 'ds', 'y'
-    n_lags           : окно AR-Net в периодах (None = автоматически ~24ч)
-    epochs           : число эпох обучения
-    save_path        : путь для сохранения модели (.np файл)
+    n_lags           : окно AR-Net (None = автоматически ~24ч)
+    epochs           : число эпох на каждую комбинацию
+    save_path        : путь для сохранения лучшей модели
+    max_evals        : максимум комбинаций из полного grid (seed=42)
 
     Returns
     -------
-    Обученная модель NeuralProphet
+    Лучшая обученная модель NeuralProphet
     """
     try:
-        from neuralprophet import NeuralProphet
+        from neuralprophet import NeuralProphet  # noqa: F401
     except ImportError as exc:
-        raise ImportError(
-            "NeuralProphet не установлен. Установите:\n"
-            "  pip install neuralprophet"
-        ) from exc
+        raise ImportError("pip install neuralprophet") from exc
 
     if "ds" not in train_df.columns or "y" not in train_df.columns:
         raise ValueError("train_df должен содержать колонки 'ds' и 'y'")
@@ -125,55 +144,70 @@ def train_neural_prophet(
     train_df["ds"] = pd.to_datetime(train_df["ds"])
     val_df["ds"]   = pd.to_datetime(val_df["ds"])
 
-    freq = _infer_freq(train_df["ds"])
+    freq   = _infer_freq(train_df["ds"])
+    yearly = _enough_for_yearly(train_df["ds"])
     if n_lags is None:
         n_lags = _auto_n_lags(train_df["ds"])
 
-    yearly = _enough_for_yearly(train_df["ds"])
+    import logging, random
+    from itertools import product as _product
+    import numpy as np
+    logging.getLogger("NP.df_utils").setLevel(logging.ERROR)
+    logging.getLogger("NP.forecaster").setLevel(logging.ERROR)
+
+    param_grid = {
+        "n_changepoints":  [10, 20, 30],
+        "trend_reg":       [0.05, 0.1, 1.0],
+        "seasonality_reg": [0.05, 0.1, 1.0],
+        "ar_reg":          [0.05, 0.1],
+    }
+    all_params = [dict(zip(param_grid.keys(), v))
+                  for v in _product(*param_grid.values())]
+    rng = random.Random(42)
+    all_params = rng.sample(all_params, min(len(all_params), max_evals))
 
     if verbose:
         print(f"  NeuralProphet: freq={freq}, n_lags={n_lags}, "
               f"epochs={epochs}, yearly={yearly}")
+        print(f"  NeuralProphet grid-search: {len(all_params)} комбинаций")
 
-    # Подавляем многословный вывод NeuralProphet
-    import logging
-    logging.getLogger("NP.df_utils").setLevel(logging.ERROR)
-    logging.getLogger("NP.forecaster").setLevel(logging.ERROR)
+    best_model, best_mae = None, float("inf")
 
-    try:
-        m = NeuralProphet(
-            n_forecasts=1,
-            n_lags=n_lags,
-            yearly_seasonality=yearly,
-            weekly_seasonality=True,
-            daily_seasonality=True,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            trainer_config={"enable_progress_bar": False},
-        )
-    except TypeError:
-        # Старые версии NeuralProphet не имеют trainer_config
-        m = NeuralProphet(
-            n_forecasts=1,
-            n_lags=n_lags,
-            yearly_seasonality=yearly,
-            weekly_seasonality=True,
-            daily_seasonality=True,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-        )
+    for params in all_params:
+        try:
+            m = _build_np_model(
+                n_lags=n_lags,
+                n_changepoints=params["n_changepoints"],
+                trend_reg=params["trend_reg"],
+                seasonality_reg=params["seasonality_reg"],
+                ar_reg=params["ar_reg"],
+                yearly=yearly,
+                epochs=epochs,
+            )
+            m.fit(train_df, freq=freq, validation_df=val_df)
+            val_full = pd.concat([train_df, val_df]).sort_values("ds")
+            pred_df  = m.predict(val_full)
+            col = "yhat1" if "yhat1" in pred_df.columns else "yhat"
+            preds = pred_df[col].values[-len(val_df):]
+            mae   = float(np.mean(np.abs(val_df["y"].values[:len(preds)] - preds)))
+            if mae < best_mae:
+                best_mae   = mae
+                best_model = m
+                best_params_found = params
+        except Exception:
+            continue
 
-    m.fit(train_df, freq=freq, validation_df=val_df)
+    if best_model is None:
+        raise RuntimeError("Все комбинации NeuralProphet не удалось обучить")
 
     if verbose:
-        print(f"  NeuralProphet обучен: n_lags={m.n_lags}, freq={freq}")
+        print(f"  Best NeuralProphet: {best_params_found}  →  val MAE={best_mae:.2f}")
+        print(f"  NeuralProphet обучен: n_lags={best_model.n_lags}, freq={freq}")
 
     if save_path:
-        save_neural_prophet(m, save_path)
+        save_neural_prophet(best_model, save_path)
 
-    return m
+    return best_model
 
 
 # ---------------------------------------------------------------------------
