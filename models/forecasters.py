@@ -116,32 +116,19 @@ def train_xgboost_random_search(
     early_stopping_rounds: int = 20,
     save_path: str = None,
     random_state: int = 42,
+    sample_weight=None,
 ) -> tuple:
     """
-    Random Search по гиперпараметрам XGBoost.
+    Optuna TPE поиск гиперпараметров XGBoost (замена Random Search).
+    При отсутствии optuna — fallback на Random Search.
 
     Возвращает (best_model, best_params, best_rmse).
     """
     import xgboost as xgb
     from sklearn.metrics import mean_squared_error
 
-    param_grid = {
-        "max_depth":        [4, 5, 6, 7, 8],
-        "learning_rate":    [0.01, 0.03, 0.05, 0.07, 0.10],
-        "subsample":        [0.6, 0.7, 0.8, 0.9],
-        "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
-        "min_child_weight": [1, 3, 5, 7],
-        "reg_alpha":        [0.0, 0.05, 0.1, 0.3],
-        "reg_lambda":       [0.5, 1.0, 1.5, 2.0],
-    }
-
-    rng = np.random.default_rng(random_state)
-    best_model, best_params, best_rmse = None, None, float("inf")
-
-    print(f"  XGBoost Random Search: {n_iter} итераций...")
-    for i in range(n_iter):
-        params = {k: rng.choice(v).item() for k, v in param_grid.items()}
-        model = xgb.XGBRegressor(
+    def _fit(params: dict):
+        m = xgb.XGBRegressor(
             objective="reg:squarederror",
             n_estimators=500,
             early_stopping_rounds=early_stopping_rounds,
@@ -150,16 +137,71 @@ def train_xgboost_random_search(
             random_state=random_state,
             **params,
         )
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-        val_preds = np.clip(model.predict(X_val), 0, None)
-        rmse = float(mean_squared_error(y_val, val_preds) ** 0.5)
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_model = model
-            best_params = params
-            print(f"    [{i+1}/{n_iter}] новый лучший RMSE={rmse:.4f}  params={params}")
+        m.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+              sample_weight=sample_weight, verbose=False)
+        return m
 
-    print(f"  XGBoost Random Search завершён: RMSE={best_rmse:.4f}")
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        best_model, best_params, best_rmse = None, None, float("inf")
+
+        def objective(trial):
+            nonlocal best_model, best_params, best_rmse
+            params = {
+                "max_depth":        trial.suggest_int("max_depth", 3, 8),
+                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 7),
+                "reg_alpha":        trial.suggest_float("reg_alpha", 0.0, 0.3),
+                "reg_lambda":       trial.suggest_float("reg_lambda", 0.5, 2.0),
+            }
+            m = _fit(params)
+            val_preds = np.clip(m.predict(X_val), 0, None)
+            rmse = float(mean_squared_error(y_val, val_preds) ** 0.5)
+            if rmse < best_rmse:
+                best_rmse  = rmse
+                best_model = m
+                best_params = params
+            return rmse
+
+        print(f"  XGBoost Optuna TPE: {n_iter} trials...")
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=random_state),
+        )
+        study.optimize(objective, n_trials=n_iter, show_progress_bar=True)
+        print(f"  XGBoost Optuna завершён: RMSE={best_rmse:.4f}  params={best_params}")
+
+    except ImportError:
+        # Fallback: Random Search если optuna не установлена
+        param_grid = {
+            "max_depth":        [4, 5, 6, 7, 8],
+            "learning_rate":    [0.01, 0.03, 0.05, 0.07, 0.10],
+            "subsample":        [0.6, 0.7, 0.8, 0.9],
+            "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
+            "min_child_weight": [1, 3, 5, 7],
+            "reg_alpha":        [0.0, 0.05, 0.1, 0.3],
+            "reg_lambda":       [0.5, 1.0, 1.5, 2.0],
+        }
+        rng = np.random.default_rng(random_state)
+        best_model, best_params, best_rmse = None, None, float("inf")
+
+        print(f"  XGBoost Random Search: {n_iter} итераций...")
+        for i in range(n_iter):
+            params = {k: rng.choice(v).item() for k, v in param_grid.items()}
+            m = _fit(params)
+            val_preds = np.clip(m.predict(X_val), 0, None)
+            rmse = float(mean_squared_error(y_val, val_preds) ** 0.5)
+            if rmse < best_rmse:
+                best_rmse  = rmse
+                best_model = m
+                best_params = params
+                print(f"    [{i+1}/{n_iter}] новый лучший RMSE={rmse:.4f}  params={params}")
+        print(f"  XGBoost Random Search завершён: RMSE={best_rmse:.4f}")
+
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         joblib.dump(best_model, save_path)
