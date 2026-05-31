@@ -2,8 +2,7 @@
 XGBoost — основная прогностическая модель (глава 2.6.2 ВКР).
 
 Особенности реализации:
-  - Optuna TPE для подбора гиперпараметров (n_trials=25)
-  - Early stopping по валидационной выборке на каждом trial
+  - Early stopping по валидационной выборке (параметр early_stopping_rounds)
   - Квантильная регрессия для доверительных интервалов (q=0.1 и q=0.9)
   - Сохранение важности признаков
 """
@@ -29,72 +28,37 @@ def train_xgboost(
     learning_rate: float = 0.05,
     early_stopping_rounds: int = 20,
     save_path: str = None,
-    n_trials: int = 25,
 ):
     """
-    Обучает XGBRegressor с Optuna TPE поиском гиперпараметров.
+    Обучает XGBRegressor с ранней остановкой.
 
     Parameters
     ----------
-    X_train, y_train      : обучающая выборка
-    X_val,   y_val        : валидационная выборка (early stopping + Optuna)
-    early_stopping_rounds : раундов без улучшения до остановки
-    save_path             : путь для сохранения через joblib
-    n_trials              : число Optuna-trials (25 ≈ хорошее качество за ~1 мин)
+    X_train, y_train : обучающая выборка
+    X_val,   y_val   : валидационная выборка (для ранней остановки)
+    early_stopping_rounds : число раундов без улучшения до остановки
+    save_path        : путь для сохранения через joblib (None — не сохранять)
     """
-    try:
-        import optuna
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        _use_optuna = True
-    except ImportError:
-        _use_optuna = False
-
-    def _fit(params: dict):
-        m = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=n_estimators,
-            early_stopping_rounds=early_stopping_rounds,
-            eval_metric="rmse",
-            verbosity=0,
-            random_state=42,
-            **params,
-        )
-        m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-        return m
-
-    if _use_optuna:
-        def objective(trial):
-            params = {
-                "max_depth":        trial.suggest_int("max_depth", 3, 8),
-                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-                "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
-                "reg_alpha":        trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
-                "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 1.0, log=True),
-            }
-            m = _fit(params)
-            preds = np.clip(m.predict(X_val), 0, None)
-            return float(np.mean(np.abs(y_val - preds)))
-
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=optuna.samplers.TPESampler(seed=42),
-        )
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-        best_params = study.best_params
-        print(f"  XGBoost Optuna best: {best_params}  →  val MAE={study.best_value:.2f}")
-        model = _fit(best_params)
-    else:
-        model = _fit(dict(
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=3,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-        ))
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        early_stopping_rounds=early_stopping_rounds,
+        eval_metric="rmse",
+        verbosity=0,
+        random_state=42,
+    )
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
 
     if save_path:
         dirpath = os.path.dirname(save_path)

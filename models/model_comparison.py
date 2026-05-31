@@ -29,6 +29,7 @@ from preprocessing.feature_engineering import (
     _hours_to_periods,
 )
 from models.xgboost_model import train_xgboost, predict_xgboost
+from models.forecasters import train_xgboost_random_search
 from evaluation.metrics import evaluate, print_comparison_table
 
 
@@ -175,7 +176,7 @@ class ModelComparison:
         print(f"\n{label} XGBoost...")
         t0 = time.time()
         save_path = os.path.join(self.model_save_dir, "xgboost.pkl")
-        model = train_xgboost(X_train, y_train, X_val, y_val, save_path=save_path)
+        model, _, _ = train_xgboost_random_search(X_train, y_train, X_val, y_val, save_path=save_path)
         preds = predict_xgboost(model, X_test)
         elapsed = time.time() - t0
         metrics = evaluate(y_test.values, preds, "XGBoost", verbose=True)
