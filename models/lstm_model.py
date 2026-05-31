@@ -146,74 +146,21 @@ def _make_windows(
 # Обучение
 # ---------------------------------------------------------------------------
 
-def train_lstm(
-    X_train: pd.DataFrame, y_train: pd.Series,
-    X_val: pd.DataFrame,   y_val: pd.Series,
-    window_size: int = 24,
-    epochs: int = 80,
-    batch_size: int = 64,
-    lr: float = 1e-3,
-    units_l1: int = 64,
-    units_l2: int = 32,
-    dropout: float = 0.3,
-    huber_delta: float = 1.0,
-    patience: int = 10,
-    save_path: Optional[str] = None,
-    verbose: int = 0,
-) -> LSTMArtifact:
-    """
-    Обучает multivariate LSTM на признаках FeatureBuilder.
-
-    Контракт скейлеров (КРИТИЧНО для отсутствия утечки):
-      feature_scaler.fit(X_train)             # ← только train
-      X_train_s = feature_scaler.transform(X_train)
-      X_val_s   = feature_scaler.transform(X_val)   # без re-fit!
-
-    То же для target_scaler.
-
-    Parameters
-    ----------
-    X_train, X_val : DataFrame с признаками (от FeatureBuilder.transform_splits)
-    y_train, y_val : Series с целевой переменной
-    window_size    : длина окна в ПЕРИОДАХ. Для 5-минутных данных 288 = 24ч.
-                     Должна покрывать суточную сезонность.
-    huber_delta    : параметр Huber loss. Меньше → ближе к L1 (робастнее
-                     к выбросам), больше → ближе к L2.
-    """
-    # Импорт внутри функции, чтобы модуль импортировался даже без TF
+def _build_and_fit_lstm(
+    Xtr_w, ytr_w, Xvl_w, yvl_w,
+    window_size, n_features,
+    units_l1, units_l2, dropout, lr, batch_size,
+    huber_delta, epochs, patience, verbose,
+    trial=None,
+):
+    """Вспомогательная функция: строит и обучает одну LSTM-модель."""
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dropout, Dense, Input
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     from tensorflow.keras.losses import Huber
     from tensorflow.keras.optimizers import Adam
-    from sklearn.preprocessing import StandardScaler
 
-    # Определённость прогона: важно для воспроизводимости в ВКР
-    np.random.seed(42)
-    tf.random.set_seed(42)
-
-    feature_names = list(X_train.columns)
-
-    # ---- Скейлеры: fit ТОЛЬКО на train ----
-    feature_scaler = StandardScaler()
-    target_scaler  = StandardScaler()
-
-    feature_scaler.fit(X_train.values)
-    target_scaler.fit(y_train.values.reshape(-1, 1))
-
-    Xtr_s = feature_scaler.transform(X_train.values)
-    Xvl_s = feature_scaler.transform(X_val.values)
-    ytr_s = target_scaler.transform(y_train.values.reshape(-1, 1)).flatten()
-    yvl_s = target_scaler.transform(y_val.values.reshape(-1, 1)).flatten()
-
-    # ---- Sliding-window батчи ----
-    Xtr_w, ytr_w = _make_windows(Xtr_s, ytr_s, window_size)
-    Xvl_w, yvl_w = _make_windows(Xvl_s, yvl_s, window_size)
-
-    n_features = Xtr_w.shape[2]
-
-    # ---- Архитектура ----
     model = Sequential([
         Input(shape=(window_size, n_features)),
         LSTM(units_l1, return_sequences=True),
@@ -236,6 +183,19 @@ def train_lstm(
                           min_lr=1e-5, verbose=verbose),
     ]
 
+    # Callback для Optuna Hyperband pruning
+    if trial is not None:
+        try:
+            import optuna
+            class _PruneCallback(tf.keras.callbacks.Callback):
+                def on_epoch_end(self, epoch, logs=None):
+                    trial.report(float(logs.get("val_mae", float("inf"))), epoch)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+            callbacks.append(_PruneCallback())
+        except ImportError:
+            pass
+
     model.fit(
         Xtr_w, ytr_w,
         validation_data=(Xvl_w, yvl_w),
@@ -243,8 +203,119 @@ def train_lstm(
         batch_size=batch_size,
         callbacks=callbacks,
         verbose=verbose,
-        shuffle=False,                   # КРИТИЧНО: time-series, без перемешивания
+        shuffle=False,
     )
+    return model
+
+
+def train_lstm(
+    X_train: pd.DataFrame, y_train: pd.Series,
+    X_val: pd.DataFrame,   y_val: pd.Series,
+    window_size: int = 24,
+    epochs: int = 80,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    units_l1: int = 64,
+    units_l2: int = 32,
+    dropout: float = 0.3,
+    huber_delta: float = 1.0,
+    patience: int = 10,
+    save_path: Optional[str] = None,
+    verbose: int = 0,
+    n_trials: int = 15,
+) -> LSTMArtifact:
+    """
+    Обучает multivariate LSTM на признаках FeatureBuilder.
+
+    При наличии optuna запускает Hyperband поиск гиперпараметров (n_trials).
+    Hyperband отсеивает плохие конфигурации на ранних эпохах, экономя время.
+    При отсутствии optuna — фиксированные параметры (обратная совместимость).
+
+    Контракт скейлеров (КРИТИЧНО для отсутствия утечки):
+      feature_scaler.fit(X_train)           # ← только train
+      X_val_s = feature_scaler.transform(X_val)  # без re-fit!
+    """
+    import tensorflow as tf
+    from sklearn.preprocessing import StandardScaler
+
+    np.random.seed(42)
+    tf.random.set_seed(42)
+
+    feature_names = list(X_train.columns)
+
+    # ---- Скейлеры: fit ТОЛЬКО на train ----
+    feature_scaler = StandardScaler()
+    target_scaler  = StandardScaler()
+    feature_scaler.fit(X_train.values)
+    target_scaler.fit(y_train.values.reshape(-1, 1))
+
+    Xtr_s = feature_scaler.transform(X_train.values)
+    Xvl_s = feature_scaler.transform(X_val.values)
+    ytr_s = target_scaler.transform(y_train.values.reshape(-1, 1)).flatten()
+    yvl_s = target_scaler.transform(y_val.values.reshape(-1, 1)).flatten()
+
+    Xtr_w, ytr_w = _make_windows(Xtr_s, ytr_s, window_size)
+    Xvl_w, yvl_w = _make_windows(Xvl_s, yvl_s, window_size)
+    n_features = Xtr_w.shape[2]
+
+    def _fit(p, trial=None):
+        return _build_and_fit_lstm(
+            Xtr_w, ytr_w, Xvl_w, yvl_w,
+            window_size, n_features,
+            units_l1=p["units_l1"], units_l2=p["units_l2"],
+            dropout=p["dropout"], lr=p["lr"], batch_size=p["batch_size"],
+            huber_delta=huber_delta, epochs=epochs,
+            patience=patience, verbose=verbose, trial=trial,
+        )
+
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        best_params, best_mae, best_model = None, float("inf"), None
+
+        def objective(trial):
+            nonlocal best_params, best_mae, best_model
+            p = {
+                "units_l1":   trial.suggest_categorical("units_l1", [32, 64, 128]),
+                "units_l2":   trial.suggest_categorical("units_l2", [16, 32, 64]),
+                "dropout":    trial.suggest_float("dropout", 0.1, 0.5),
+                "lr":         trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+                "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
+            }
+            try:
+                m = _fit(p, trial=trial)
+                val_preds = m.predict(Xvl_w, verbose=0).flatten()
+                mae = float(np.mean(np.abs(yvl_s - val_preds)))
+                if mae < best_mae:
+                    best_mae = mae
+                    best_params = p
+                    best_model = m
+                return mae
+            except optuna.TrialPruned:
+                raise
+            except Exception:
+                return float("inf")
+
+        print(f"  LSTM Optuna Hyperband: {n_trials} trials...")
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.HyperbandPruner(
+                min_resource=3, max_resource=epochs, reduction_factor=3
+            ),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        print(f"  LSTM Hyperband завершён: val MAE={best_mae:.4f}  params={best_params}")
+        model = best_model
+
+    except ImportError:
+        # Fallback: фиксированные параметры
+        print("  LSTM обучается с фиксированными параметрами (optuna не установлена)...")
+        model = _fit(dict(
+            units_l1=units_l1, units_l2=units_l2,
+            dropout=dropout, lr=lr, batch_size=batch_size,
+        ))
 
     artifact = LSTMArtifact(
         keras_model=model,
