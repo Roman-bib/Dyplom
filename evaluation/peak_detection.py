@@ -290,6 +290,9 @@ class PeakDetector:
         rps_series: pd.Series,
         predicted_series: pd.Series,
         recompute_every: Optional[int] = None,
+        upper_ci_series: Optional[pd.Series] = None,
+        campaign_p95: Optional[float] = None,
+        campaign_mask: Optional[pd.Series] = None,
     ) -> pd.DataFrame:
         """
         Применяет детекцию ко всему ряду.
@@ -298,7 +301,12 @@ class PeakDetector:
         ----------
         recompute_every : если задан и method='adaptive_percentile' — пересчитывает
                           порог каждые N точек по последнему окну self.window.
-                          Это и есть «настоящий» адаптивный порог.
+        upper_ci_series : верхняя граница ДИ (Q90). Если передана — реплики
+                          считаются по ней, а не по точечному прогнозу.
+        campaign_p95    : P95 RPS из исторических кампаний. Если передан вместе
+                          с campaign_mask — в периоды кампании реплики считаются
+                          по max(predicted, upper_ci, campaign_p95).
+        campaign_mask   : булева серия той же длины что rps_series; True = кампания.
 
         Returns
         -------
@@ -309,6 +317,15 @@ class PeakDetector:
         rolling_threshold = self.threshold
         history_buffer: list = list(self._fit_history.values) \
             if self._fit_history is not None else []
+
+        # Верхняя граница CI выровнена по длине predicted_series
+        upper_ci_arr: Optional[np.ndarray] = None
+        if upper_ci_series is not None:
+            upper_ci_arr = np.asarray(upper_ci_series.values, dtype=float)
+
+        campaign_arr: Optional[np.ndarray] = None
+        if campaign_mask is not None:
+            campaign_arr = np.asarray(campaign_mask.values, dtype=bool)
 
         # Скользящее среднее для вычисления остатка (приближение r_t)
         rps_arr = np.asarray(rps_series.values, dtype=float)
@@ -343,11 +360,21 @@ class PeakDetector:
                 threshold_override=rolling_threshold,
             )
 
-            # При аномальном пике — добавляем запас реплик
-            replicas = event.recommended_replicas
+            # Реплики: берём max(predicted, upper_ci, campaign_p95) при кампании
+            rps_for_replicas = float(pred)
+            if upper_ci_arr is not None and i < len(upper_ci_arr):
+                rps_for_replicas = max(rps_for_replicas, float(upper_ci_arr[i]))
+            if (campaign_p95 is not None
+                    and campaign_arr is not None
+                    and i < len(campaign_arr)
+                    and campaign_arr[i]):
+                rps_for_replicas = max(rps_for_replicas, campaign_p95)
+            replicas = self._calculate_replicas(rps_for_replicas)
+
+            # При аномальном пике — дополнительный запас k_safety
             if is_anom and event.is_peak:
                 replicas = int(np.clip(
-                    np.ceil(float(pred) * self.k_safety / max(self.target_rps, 1)),
+                    np.ceil(rps_for_replicas * self.k_safety / max(self.target_rps, 1)),
                     self.min_replicas, self.max_replicas,
                 ))
 
