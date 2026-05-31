@@ -151,7 +151,6 @@ def _build_and_fit_lstm(
     window_size, n_features,
     units_l1, units_l2, dropout, lr, batch_size,
     huber_delta, epochs, patience, verbose,
-    trial=None,
 ):
     """Вспомогательная функция: строит и обучает одну LSTM-модель."""
     import tensorflow as tf
@@ -182,19 +181,6 @@ def _build_and_fit_lstm(
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5,
                           min_lr=1e-5, verbose=verbose),
     ]
-
-    # Callback для Optuna Hyperband pruning
-    if trial is not None:
-        try:
-            import optuna
-            class _PruneCallback(tf.keras.callbacks.Callback):
-                def on_epoch_end(self, epoch, logs=None):
-                    trial.report(float(logs.get("val_mae", float("inf"))), epoch)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned()
-            callbacks.append(_PruneCallback())
-        except ImportError:
-            pass
 
     model.fit(
         Xtr_w, ytr_w,
@@ -258,14 +244,15 @@ def train_lstm(
     Xvl_w, yvl_w = _make_windows(Xvl_s, yvl_s, window_size)
     n_features = Xtr_w.shape[2]
 
-    def _fit(p, trial=None):
+    def _fit(p, epochs_override=None):
         return _build_and_fit_lstm(
             Xtr_w, ytr_w, Xvl_w, yvl_w,
             window_size, n_features,
             units_l1=p["units_l1"], units_l2=p["units_l2"],
             dropout=p["dropout"], lr=p["lr"], batch_size=p["batch_size"],
-            huber_delta=huber_delta, epochs=epochs,
-            patience=patience, verbose=verbose, trial=trial,
+            huber_delta=huber_delta,
+            epochs=epochs_override if epochs_override is not None else epochs,
+            patience=patience, verbose=verbose,
         )
 
     try:
@@ -273,6 +260,7 @@ def train_lstm(
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         best_params, best_mae, best_model = None, float("inf"), None
+        search_epochs = max(10, epochs // 4)  # быстрый поиск на сокращённых эпохах
 
         def objective(trial):
             nonlocal best_params, best_mae, best_model
@@ -284,33 +272,34 @@ def train_lstm(
                 "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
             }
             try:
-                m = _fit(p, trial=trial)
+                m = _fit(p, epochs_override=search_epochs)
                 val_preds = m.predict(Xvl_w, verbose=0).flatten()
                 mae = float(np.mean(np.abs(yvl_s - val_preds)))
                 if mae < best_mae:
-                    best_mae = mae
+                    best_mae   = mae
                     best_params = p
                     best_model = m
                 return mae
-            except optuna.TrialPruned:
-                raise
             except Exception:
                 return float("inf")
 
-        print(f"  LSTM Optuna Hyperband: {n_trials} trials...")
+        print(f"  LSTM Optuna TPE: {n_trials} trials × {search_epochs} эпох поиска...")
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=42),
-            pruner=optuna.pruners.HyperbandPruner(
-                min_resource=3, max_resource=epochs, reduction_factor=3
-            ),
         )
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-        print(f"  LSTM Hyperband завершён: val MAE={best_mae:.4f}  params={best_params}")
-        model = best_model
+
+        if best_params is not None:
+            print(f"  LSTM TPE завершён: val MAE={best_mae:.4f}  params={best_params}")
+            print(f"  LSTM финальное обучение на {epochs} эпохах...")
+            model = _fit(best_params)
+        else:
+            print("  LSTM TPE: все trials упали, fallback на фиксированные параметры")
+            model = _fit(dict(units_l1=units_l1, units_l2=units_l2,
+                              dropout=dropout, lr=lr, batch_size=batch_size))
 
     except ImportError:
-        # Fallback: фиксированные параметры
         print("  LSTM обучается с фиксированными параметрами (optuna не установлена)...")
         model = _fit(dict(
             units_l1=units_l1, units_l2=units_l2,
