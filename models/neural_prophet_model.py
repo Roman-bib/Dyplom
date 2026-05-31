@@ -171,6 +171,11 @@ def train_neural_prophet(
               f"epochs={epochs}, yearly={yearly}")
         print(f"  NeuralProphet grid-search: {len(all_params)} комбинаций")
 
+    # Патч torch.load для совместимости с PyTorch 2.6
+    import torch as _torch
+    _orig_load = _torch.load
+    _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
+
     best_model, best_mae = None, float("inf")
 
     for params in all_params:
@@ -196,6 +201,8 @@ def train_neural_prophet(
                 best_params_found = params
         except Exception:
             continue
+
+    _torch.load = _orig_load  # восстанавливаем torch.load
 
     if best_model is None:
         raise RuntimeError("Все комбинации NeuralProphet не удалось обучить")
