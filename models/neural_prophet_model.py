@@ -103,7 +103,11 @@ def _build_np_model(n_lags, n_changepoints, trend_reg, seasonality_reg,
         return NeuralProphet(**kwargs)
     except TypeError:
         kwargs.pop("trainer_config", None)
-        return NeuralProphet(**kwargs)
+        try:
+            return NeuralProphet(**kwargs)
+        except TypeError:
+            kwargs.pop("early_stopping", None)
+            return NeuralProphet(**kwargs)
 
 
 def train_neural_prophet(
