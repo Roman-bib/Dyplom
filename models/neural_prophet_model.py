@@ -67,7 +67,7 @@ def _enough_for_yearly(ds: pd.Series) -> bool:
 def _auto_n_lags(ds: pd.Series) -> int:
     """
     Возвращает число лагов для AR-Net равное ~24 часам в периодах данных.
-    Минимум 12, максимум 336 (чтобы не тормозило на очень мелком шаге).
+    Минимум 12, максимум 48 (чтобы не тормозило на очень мелком шаге).
     """
     ds = pd.to_datetime(ds).sort_values()
     if len(ds) < 2:
@@ -75,7 +75,7 @@ def _auto_n_lags(ds: pd.Series) -> int:
     step_sec = float(ds.diff().dropna().dt.total_seconds().median())
     step_min = step_sec / 60
     n = int(round(24 * 60 / step_min))
-    return max(12, min(n, 336))
+    return max(12, min(n, 48))
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,7 @@ def _build_np_model(n_lags, n_changepoints, trend_reg, seasonality_reg,
         weekly_seasonality=True,
         daily_seasonality=True,
         epochs=epochs,
+        early_stopping=True,
         trainer_config={"enable_progress_bar": True},
     )
     try:
@@ -112,20 +113,20 @@ def train_neural_prophet(
     epochs: int = 50,
     save_path: Optional[str] = None,
     verbose: bool = True,
-    max_evals: int = 36,
+    n_trials: int = 15,
 ) -> object:
     """
-    Обучает NeuralProphet с grid-search по гиперпараметрам.
+    Обучает NeuralProphet с Bayesian-поиском гиперпараметров (Optuna).
 
     КРИТИЧНО: train_df и val_df — строго разные временные срезы.
 
     Parameters
     ----------
     train_df, val_df : DataFrame с колонками 'ds', 'y'
-    n_lags           : окно AR-Net (None = автоматически ~24ч)
-    epochs           : число эпох на каждую комбинацию
+    n_lags           : окно AR-Net (None = автоматически ~24ч, макс 48)
+    epochs           : максимум эпох на trial; early_stopping остановит раньше
     save_path        : путь для сохранения лучшей модели
-    max_evals        : максимум комбинаций из полного grid (seed=42)
+    n_trials         : число Optuna-trials (15 ≈ random-36 по качеству)
 
     Returns
     -------
@@ -135,6 +136,11 @@ def train_neural_prophet(
         from neuralprophet import NeuralProphet  # noqa: F401
     except ImportError as exc:
         raise ImportError("pip install neuralprophet") from exc
+
+    try:
+        import optuna as _optuna
+    except ImportError as exc:
+        raise ImportError("pip install optuna") from exc
 
     if "ds" not in train_df.columns or "y" not in train_df.columns:
         raise ValueError("train_df должен содержать колонки 'ds' и 'y'")
@@ -149,63 +155,65 @@ def train_neural_prophet(
     if n_lags is None:
         n_lags = _auto_n_lags(train_df["ds"])
 
-    import logging, random
-    from itertools import product as _product
+    import logging
     import numpy as np
     logging.getLogger("NP.df_utils").setLevel(logging.ERROR)
     logging.getLogger("NP.forecaster").setLevel(logging.ERROR)
-
-    param_grid = {
-        "n_changepoints":  [10, 20, 30],
-        "trend_reg":       [0.05, 0.1, 1.0],
-        "seasonality_reg": [0.05, 0.1, 1.0],
-        "ar_reg":          [0.05, 0.1],
-    }
-    all_params = [dict(zip(param_grid.keys(), v))
-                  for v in _product(*param_grid.values())]
-    rng = random.Random(42)
-    all_params = rng.sample(all_params, min(len(all_params), max_evals))
+    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
 
     if verbose:
         print(f"  NeuralProphet: freq={freq}, n_lags={n_lags}, "
               f"epochs={epochs}, yearly={yearly}")
-        print(f"  NeuralProphet grid-search: {len(all_params)} комбинаций")
+        print(f"  NeuralProphet Optuna search: {n_trials} trials")
 
     # Патч torch.load для совместимости с PyTorch 2.6
     import torch as _torch
     _orig_load = _torch.load
     _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
 
-    best_model, best_mae = None, float("inf")
+    val_full = pd.concat([train_df, val_df]).sort_values("ds")
+    best_model: object = None
+    best_mae = float("inf")
+    best_params_found: dict = {}
 
-    for params in all_params:
+    def objective(trial: "_optuna.Trial") -> float:
+        nonlocal best_model, best_mae, best_params_found
+        params = {
+            "n_changepoints":  trial.suggest_categorical("n_changepoints", [10, 20, 30]),
+            "trend_reg":       trial.suggest_float("trend_reg", 0.05, 1.0, log=True),
+            "seasonality_reg": trial.suggest_float("seasonality_reg", 0.05, 1.0, log=True),
+            "ar_reg":          trial.suggest_float("ar_reg", 0.05, 0.1, log=True),
+        }
         try:
             m = _build_np_model(
                 n_lags=n_lags,
-                n_changepoints=params["n_changepoints"],
-                trend_reg=params["trend_reg"],
-                seasonality_reg=params["seasonality_reg"],
-                ar_reg=params["ar_reg"],
                 yearly=yearly,
                 epochs=epochs,
+                **params,
             )
             m.fit(train_df, freq=freq, validation_df=val_df)
-            val_full = pd.concat([train_df, val_df]).sort_values("ds")
-            pred_df  = m.predict(val_full)
+            pred_df = m.predict(val_full)
             col = "yhat1" if "yhat1" in pred_df.columns else "yhat"
             preds = pred_df[col].values[-len(val_df):]
-            mae   = float(np.mean(np.abs(val_df["y"].values[:len(preds)] - preds)))
+            mae = float(np.mean(np.abs(val_df["y"].values[:len(preds)] - preds)))
             if mae < best_mae:
-                best_mae   = mae
+                best_mae = mae
                 best_model = m
                 best_params_found = params
+            return mae
         except Exception:
-            continue
+            return float("inf")
+
+    study = _optuna.create_study(
+        direction="minimize",
+        sampler=_optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
 
     _torch.load = _orig_load  # восстанавливаем torch.load
 
     if best_model is None:
-        raise RuntimeError("Все комбинации NeuralProphet не удалось обучить")
+        raise RuntimeError("Все trials NeuralProphet завершились с ошибкой")
 
     if verbose:
         print(f"  Best NeuralProphet: {best_params_found}  →  val MAE={best_mae:.2f}")
