@@ -166,6 +166,9 @@ class PeakDetector:
         self.window = window
         self.k_safety = float(k_safety)
         self._if_detector: Optional[IsolationForestAnomalyDetector] = None
+        self._drift_detector = None   # ADWINDriftDetector для дрейфа базовой линии
+        self._baseline_mean: Optional[float] = None
+        self.drift_recompute_timestamps: list = []
         self.target_rps = float(target_rps_per_replica)
         self.min_replicas = int(min_replicas)
         self.max_replicas = int(max_replicas)
@@ -218,6 +221,36 @@ class PeakDetector:
         """Обучает Isolation Forest на остатках r_t из RobustSTL."""
         self._if_detector = IsolationForestAnomalyDetector()
         self._if_detector.fit(residuals)
+        return self
+
+    def fit_drift_detector(
+        self,
+        historical_rps: pd.Series,
+        delta: float = 0.002,
+        min_obs: int = 50,
+        cooldown_n: int = 48,
+        confirmation_n: int = 5,
+    ) -> "PeakDetector":
+        """
+        Инициализирует ADWIN-детектор дрейфа базовой линии трафика.
+
+        Когда среднее RPS устойчиво смещается (концепт-дрейф), детектор
+        сигнализирует и порог детекции пиков пересчитывается автоматически.
+        cooldown_n=48 и confirmation_n=5 защищают от ложных срабатываний
+        на кратковременных пиках.
+        """
+        from retraining.drift_detector import ADWINDriftDetector
+        arr = np.asarray(historical_rps.dropna().values, dtype=float)
+        self._baseline_mean = float(np.mean(arr))
+        self._drift_detector = ADWINDriftDetector(
+            delta=delta,
+            min_obs=min_obs,
+            cooldown_n=cooldown_n,
+            confirmation_n=confirmation_n,
+            n_fresh=0,
+        )
+        self._drift_detector.set_baseline(np.abs(arr - self._baseline_mean))
+        self.drift_recompute_timestamps = []
         return self
 
     @property
@@ -335,7 +368,7 @@ class PeakDetector:
         for i, (ts, cur, pred) in enumerate(zip(
             rps_series.index, rps_series.values, predicted_series.values,
         )):
-            # Адаптивный пересчёт порога
+            # Адаптивный пересчёт порога по расписанию
             if (
                 self.method == "adaptive_percentile"
                 and recompute_every
@@ -345,6 +378,21 @@ class PeakDetector:
             ):
                 tail = history_buffer[-self.window:]
                 rolling_threshold = float(np.percentile(tail, self.percentile))
+
+            # Пересчёт порога при обнаружении дрейфа базовой линии (ADWIN)
+            if self._drift_detector is not None and self._baseline_mean is not None:
+                self._drift_detector.observe(
+                    y_true=float(cur), y_pred=self._baseline_mean
+                )
+                signal = self._drift_detector.check()
+                if signal.triggered and len(history_buffer) >= self.window:
+                    tail = history_buffer[-self.window:]
+                    rolling_threshold = float(np.percentile(tail, self.percentile))
+                    self._baseline_mean = float(np.mean(tail))
+                    self._drift_detector.reset_after_retrain(
+                        np.abs(np.array(tail) - self._baseline_mean)
+                    )
+                    self.drift_recompute_timestamps.append(pd.Timestamp(ts))
 
             # Остаток ≈ отклонение от скользящей медианы (приближение r_t)
             residual = float(cur) - float(rolling_med[i])
