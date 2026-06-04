@@ -59,7 +59,7 @@ class ADWINDriftDetector:
         delta: float = 0.002,
         min_obs: int = 30,
         cooldown_n: int = 20,
-        n_fresh: int = 0,
+        n_fresh: int = 150,
         confirmation_n: int = 10,
     ):
         from river.drift import ADWIN as _ADWIN
