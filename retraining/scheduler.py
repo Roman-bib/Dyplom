@@ -284,7 +284,6 @@ def make_xgb_train_fn(
     val_fraction: float = 0.15,
     save_dir: Optional[str] = None,
     best_params: Optional[dict] = None,
-    recent_window: Optional[int] = None,
 ) -> TrainFn:
     """
     Возвращает train_fn, переобучающую XGBoost на накопленной истории.
@@ -293,18 +292,13 @@ def make_xgb_train_fn(
     последние val_fraction точек служат валидацией для early stopping
     и одновременно дают baseline_errors для нового детектора.
 
-    best_params    : параметры, найденные Random Search при начальном обучении.
-                     Если None — Random Search запускается заново на каждом retrain.
-    recent_window  : если задан, при ретрейне берётся только последние recent_window
-                     точек истории. Критично при концепт-дрейфе: без этого модель
-                     учится на 90% старых данных и игнорирует новый режим.
+    best_params : параметры, найденные Random Search при начальном обучении.
+                  Если None — Random Search запускается заново на каждом retrain.
     """
     from models.forecasters import train_xgboost, train_xgboost_random_search, predict_xgboost, predict_xgboost_wf
 
     def _train(history_df: pd.DataFrame):
         history_df = history_df.sort_values("ds").reset_index(drop=True)
-        if recent_window is not None and len(history_df) > recent_window:
-            history_df = history_df.iloc[-recent_window:].reset_index(drop=True)
         n = len(history_df)
         n_val = max(50, int(n * val_fraction))
         train_df = history_df.iloc[:-n_val].copy()
